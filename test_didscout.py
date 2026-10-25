@@ -1466,7 +1466,7 @@ def _fake_record_client(responder: Callable[[str], bytes]) -> type:
         def __init__(self, _address: str, *, timeout: float) -> None:
             self.callback: Callable[[object, bytes], None] | None = None
 
-        async def __aenter__(self) -> "FakeClient":
+        async def __aenter__(self) -> FakeClient:
             return self
 
         async def __aexit__(
@@ -1641,7 +1641,8 @@ def test_record_marks_stage_failed_after_three_consecutive_failures(
 def test_ecus11_discovery_finds_positive_and_negative_responders_and_ignores_silence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    current_header = {"value": None}
+    current_header: dict[str, str] = {"value": ""}
+    monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", list(range(0x700, 0x712)))
     replies = {
         ("710", "22F189"): b"77A0462F18901\r>",
         ("710", "22F187"): b"77A0462F18701\r>",

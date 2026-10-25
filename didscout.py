@@ -1544,17 +1544,23 @@ class RunState:
     def mark_finished(self) -> None:
         self.data["finished"] = True
 
+    def _section(self, key: str) -> dict[str, object]:
+        section = self.data[key]
+        assert isinstance(section, dict)
+        return section
+
     def stage_status(self, stage: str) -> str | None:
-        return self.data["stages"].get(stage)  # type: ignore[union-attr]
+        status = self._section("stages").get(stage)
+        return status if isinstance(status, str) else None
 
     def mark_stage(self, stage: str, status: str) -> None:
-        self.data["stages"][stage] = status  # type: ignore[index]
+        self._section("stages")[stage] = status
 
     def result(self, key: str, default: object = None) -> object:
-        return self.data["results"].get(key, default)  # type: ignore[union-attr]
+        return self._section("results").get(key, default)
 
     def set_result(self, key: str, value: object) -> None:
-        self.data["results"][key] = value  # type: ignore[index]
+        self._section("results")[key] = value
 
 
 RECORD_RUN_DIR_PATTERN = re.compile(r"record_(\d{8}_\d{6})_(.+)")
@@ -1636,9 +1642,7 @@ async def _inventory_adapter(link: AdapterLink, state: RunState, _profile: Profi
 MODE01_BITMAP_BASES = ("00", "20", "40", "60", "80", "A0")
 
 
-async def _inventory_protocol(
-    link: AdapterLink, state: RunState, profile: Profile | None
-) -> None:
+async def _inventory_protocol(link: AdapterLink, state: RunState, profile: Profile | None) -> None:
     answered: list[str] = []
     for proto, cmd in (("6", "ATSP6"), ("7", "ATSP7")):
         await link.execute(cmd, "protocol")
@@ -1732,8 +1736,8 @@ async def _inventory_ecus11(link: AdapterLink, state: RunState, profile: Profile
             if HEADER_11BIT_PATTERN.fullmatch(module.request) and module.response:
                 found.setdefault(module.request, module.response)
 
-    for request in ECU11_REQUEST_IDS:
-        req_hex = f"{request:03X}"
+    for request_id in ECU11_REQUEST_IDS:
+        req_hex = f"{request_id:03X}"
         await execute(f"ATSH{req_hex}", "ecus11-discovery")
         ex = await execute("22F189", "ecus11-discovery")
         parsed = parse_isotp("22F189", ex.response)

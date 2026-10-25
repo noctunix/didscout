@@ -62,6 +62,15 @@ On Ctrl-C, `record` automatically runs `derive` and `share` (see below) on its
 own run directory and prints the resulting paths plus a one-line hint for how
 to contribute what it found.
 
+Type a note (e.g. a reading off the display) any time and press Enter; it's
+timestamped into `capture.jsonl` even while disconnected or reconnecting.
+`idle`/`drive`/`charge`/`park` (German `leerlauf`/`fahrt`/`laden`/`parken` too)
+are recognized as phase markers. `record` also tries to hold a
+`systemd-inhibit` sleep/idle/lid-switch lock for as long as it runs, since a
+suspended laptop kills the BLE connection (`--no-inhibit` to skip it, e.g. on a
+non-systemd system) - run it inside `tmux` too, so closing the terminal
+doesn't stop the recording.
+
 ## `derive` and `share`
 
 `derive <RUN_DIR>` turns one `record` run's log into:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -2527,3 +2529,401 @@ def test_record_ctrl_c_runs_derive_and_share_on_its_own_run_dir(
 
     run_dir = next(tmp_path.glob("record_*_vehicle"))
     assert (run_dir / "report.md").exists()
+
+
+def test_record_note_sink_writes_display_entry_with_record_mode_shape(tmp_path: Path) -> None:
+    log_path = tmp_path / "capture.jsonl"
+    sink = cx._record_note_sink(log_path, "vehicle")
+
+    sink(cx.note_exchange("fahrt"), "display")
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["stage"] == "display"
+    assert entry["state"] == "vehicle"
+    assert entry["mtu"] is None
+    assert entry["mode"] == "record"
+    assert entry["command"] == "NOTE"
+    assert entry["status"] == "NOTE"
+    assert entry["response"] == "fahrt"
+
+
+def test_record_starts_note_reader_once_across_reconnects_and_stops_on_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_INITIAL_BACKOFF", 0.0)
+    monkeypatch.setattr(cx, "RECORD_MAX_BACKOFF", 0.0)
+
+    class FakeNoteReader:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    sinks: list[Callable[[cx.Exchange, str], None]] = []
+    readers: list[FakeNoteReader] = []
+
+    def fake_start_note_reader(record_fn: Callable[[cx.Exchange, str], None]) -> FakeNoteReader:
+        sinks.append(record_fn)
+        reader = FakeNoteReader()
+        readers.append(reader)
+        return reader
+
+    monkeypatch.setattr(cx, "start_note_reader", fake_start_note_reader)
+
+    protocol_attempts = {"n": 0}
+
+    async def fake_adapter(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("adapter", {})
+
+    async def fake_protocol(_link: object, state: cx.RunState, _profile: object) -> None:
+        protocol_attempts["n"] += 1
+        if protocol_attempts["n"] == 1:
+            raise cx.ProbeAbortedError("synthetic transport error")
+        state.set_result("protocol", {"answered": [], "chosen": None})
+
+    async def fake_mode01(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("mode01", {"supported_pids": []})
+
+    async def fake_obduds(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("obduds", {})
+
+    async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus11", {})
+
+    monkeypatch.setattr(
+        cx,
+        "INVENTORY_STAGE_FUNCS",
+        {
+            "adapter": fake_adapter,
+            "protocol": fake_protocol,
+            "mode01": fake_mode01,
+            "obduds": fake_obduds,
+            "ecus11": fake_ecus11,
+        },
+    )
+
+    async def fake_run_record_loop(
+        _link: object, _state: object, _profile: object, _state_path: object
+    ) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False, False))
+
+    assert result == 130
+    # One reconnect happened (the synthetic transport error), but the note
+    # reader is started exactly once for the whole run, not once per connection.
+    assert len(sinks) == 1
+    assert readers[0].stopped is True
+
+    run_dir = next(tmp_path.glob("record_*"))
+    # The sink writes independent of any BLE connection, so it still works
+    # after the run (and, by construction, while disconnected/reconnecting).
+    sinks[0](cx.note_exchange("parken"), "display")
+    note_entries = [
+        json.loads(line)
+        for line in (run_dir / "capture.jsonl").read_text().splitlines()
+        if json.loads(line).get("command") == "NOTE"
+    ]
+    assert len(note_entries) == 1
+    assert note_entries[0]["stage"] == "display"
+    assert note_entries[0]["mode"] == "record"
+    assert note_entries[0]["response"] == "parken"
+
+
+def test_start_sleep_inhibit_spawns_expected_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeProc:
+        def __init__(self) -> None:
+            self.terminated = False
+
+    spawned: dict[str, object] = {}
+
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeProc:
+        spawned["argv"] = argv
+        spawned["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/systemd-inhibit")
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    log_path = tmp_path / "capture.jsonl"
+    proc = cx._start_sleep_inhibit(log_path, "vehicle")
+
+    assert isinstance(proc, FakeProc)
+    assert spawned["argv"] == [
+        "systemd-inhibit",
+        "--what=sleep:idle:handle-lid-switch",
+        "--who=didscout",
+        "--why=recording vehicle data",
+        "--mode=block",
+        "cat",
+    ]
+    assert spawned["kwargs"] == {"stdin": subprocess.PIPE}
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(entries) == 1
+    assert entries[0]["stage"] == "connection"
+    assert entries[0]["command"] == "SLEEP_INHIBIT"
+    assert entries[0]["status"] == "HELD"
+    assert entries[0]["mode"] == "record"
+
+
+def test_start_sleep_inhibit_missing_binary_warns_and_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    log_path = tmp_path / "capture.jsonl"
+    proc = cx._start_sleep_inhibit(log_path, "vehicle")
+
+    assert proc is None
+    assert "systemd-inhibit" in capsys.readouterr().err
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["command"] == "SLEEP_INHIBIT"
+    assert entries[0]["status"] == "UNAVAILABLE"
+
+
+def test_stop_sleep_inhibit_closes_stdin_and_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> None:
+            pass
+
+    proc = FakeProc()
+    cx._stop_sleep_inhibit(proc)  # type: ignore[arg-type]
+    assert proc.stdin.closed is True
+    assert proc.terminated is True
+
+    cx._stop_sleep_inhibit(None)  # must not raise
+
+
+def test_record_no_inhibit_flag_spawns_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_INITIAL_BACKOFF", 0.0)
+    monkeypatch.setattr(cx, "RECORD_MAX_BACKOFF", 0.0)
+
+    def fail_popen(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("--no-inhibit must never spawn a subprocess")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+    class FakeNoteReader:
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(cx, "start_note_reader", lambda _record: FakeNoteReader())
+
+    async def fake_adapter(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("adapter", {})
+
+    async def fake_protocol(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("protocol", {"answered": [], "chosen": None})
+
+    async def fake_mode01(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("mode01", {"supported_pids": []})
+
+    async def fake_obduds(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("obduds", {})
+
+    async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus11", {})
+
+    monkeypatch.setattr(
+        cx,
+        "INVENTORY_STAGE_FUNCS",
+        {
+            "adapter": fake_adapter,
+            "protocol": fake_protocol,
+            "mode01": fake_mode01,
+            "obduds": fake_obduds,
+            "ecus11": fake_ecus11,
+        },
+    )
+
+    async def fake_run_record_loop(
+        _link: object, _state: object, _profile: object, _state_path: object
+    ) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False, False))
+    assert result == 130
+
+    run_dir = next(tmp_path.glob("record_*"))
+    entries = [json.loads(line) for line in (run_dir / "capture.jsonl").read_text().splitlines()]
+    assert not any(entry.get("command") == "SLEEP_INHIBIT" for entry in entries)
+
+
+def test_record_terminates_inhibit_process_on_ctrl_c(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_INITIAL_BACKOFF", 0.0)
+    monkeypatch.setattr(cx, "RECORD_MAX_BACKOFF", 0.0)
+
+    class FakeStdin:
+        def close(self) -> None:
+            pass
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> None:
+            pass
+
+    procs: list[FakeProc] = []
+
+    def fake_popen(*_args: object, **_kwargs: object) -> FakeProc:
+        proc = FakeProc()
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/systemd-inhibit")
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    class FakeNoteReader:
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(cx, "start_note_reader", lambda _record: FakeNoteReader())
+
+    async def fake_adapter(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("adapter", {})
+
+    async def fake_protocol(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("protocol", {"answered": [], "chosen": None})
+
+    async def fake_mode01(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("mode01", {"supported_pids": []})
+
+    async def fake_obduds(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("obduds", {})
+
+    async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus11", {})
+
+    monkeypatch.setattr(
+        cx,
+        "INVENTORY_STAGE_FUNCS",
+        {
+            "adapter": fake_adapter,
+            "protocol": fake_protocol,
+            "mode01": fake_mode01,
+            "obduds": fake_obduds,
+            "ecus11": fake_ecus11,
+        },
+    )
+
+    async def fake_run_record_loop(
+        _link: object, _state: object, _profile: object, _state_path: object
+    ) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False, True))
+    assert result == 130
+    assert len(procs) == 1
+    assert procs[0].terminated is True
+
+
+def test_record_terminates_inhibit_process_on_unhandled_cancellation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeStdin:
+        def close(self) -> None:
+            pass
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> None:
+            pass
+
+    procs: list[FakeProc] = []
+
+    def fake_popen(*_args: object, **_kwargs: object) -> FakeProc:
+        proc = FakeProc()
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/systemd-inhibit")
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    class FakeNoteReader:
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(cx, "start_note_reader", lambda _record: FakeNoteReader())
+
+    async def failing_protocol(_link: object, _state: cx.RunState, _profile: object) -> None:
+        raise cx.ProbeAbortedError("synthetic transport error")
+
+    async def fake_adapter(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("adapter", {})
+
+    monkeypatch.setattr(
+        cx,
+        "INVENTORY_STAGE_FUNCS",
+        {
+            "adapter": fake_adapter,
+            "protocol": failing_protocol,
+            "mode01": fake_adapter,
+            "obduds": fake_adapter,
+            "ecus11": fake_adapter,
+        },
+    )
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        # Only the reconnect backoff (RECORD_INITIAL_BACKOFF) simulates the
+        # Ctrl-C that never reaches run_record_loop's own handling; every
+        # other sleep (e.g. ElmSession.drain's 0.05s settle) must run for real
+        # so the fake adapter traffic above it still completes.
+        if seconds == cx.RECORD_INITIAL_BACKOFF:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False, True))
+
+    assert len(procs) == 1
+    assert procs[0].terminated is True

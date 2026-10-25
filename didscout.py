@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -1083,6 +1085,15 @@ class AdapterLink:
         return ex
 
 
+def _append_capture_entry(log_path: Path, entry: dict[str, object]) -> None:
+    """Appends one JSON line to a run's capture.jsonl, opening and closing the
+    file for just this write so it is safe to call from several independent
+    places (a live BLE connection, a reconnect gap, a typed note) without a
+    long-lived file handle that could interleave with another writer."""
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 @contextlib.asynccontextmanager
 async def connect_adapter(
     address: str,
@@ -1110,37 +1121,32 @@ async def connect_adapter(
         )
         await client.start_notify(UART_NOTIFY, lambda _c, data: session.on_notify(bytes(data)))
 
-        with log_path.open("a", encoding="utf-8") as log:
+        def record(ex: Exchange, stage: str, module: str | None = None) -> None:
+            entry = {
+                "stage": stage,
+                "state": label,
+                "mtu": client.mtu_size,
+                **ex.__dict__,
+                **({"module": module} if module is not None else {}),
+                **(extra_fields or {}),
+            }
+            _append_capture_entry(log_path, entry)
+            first = ex.response.splitlines()[0] if ex.response else ""
+            status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
+            print(f"{status}  {first[:60]}")
 
-            def record(ex: Exchange, stage: str, module: str | None = None) -> None:
-                entry = {
-                    "stage": stage,
-                    "state": label,
-                    "mtu": client.mtu_size,
-                    **ex.__dict__,
-                    **({"module": module} if module is not None else {}),
-                    **(extra_fields or {}),
-                }
-                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                log.flush()
-                first = ex.response.splitlines()[0] if ex.response else ""
-                status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
-                print(f"{status}  {first[:60]}")
+        if pair:
+            # The adapter may already be bonded from a previous run - pair()
+            # raising then is expected, not a reason to abort the connection.
+            try:
+                await client.pair()
+            except Exception as error:
+                record(
+                    Exchange("PAIR", str(error), "PAIR_FAILED", datetime.now(UTC).isoformat(), 0.0),
+                    "connection",
+                )
 
-            if pair:
-                # The adapter may already be bonded from a previous run - pair()
-                # raising then is expected, not a reason to abort the connection.
-                try:
-                    await client.pair()
-                except Exception as error:
-                    record(
-                        Exchange(
-                            "PAIR", str(error), "PAIR_FAILED", datetime.now(UTC).isoformat(), 0.0
-                        ),
-                        "connection",
-                    )
-
-            yield AdapterLink(session, record, non_critical_at)
+        yield AdapterLink(session, record, non_critical_at)
         await client.stop_notify(UART_NOTIFY)
 
 
@@ -3037,11 +3043,73 @@ RECORD_INITIAL_BACKOFF = 5.0
 RECORD_MAX_BACKOFF = 60.0
 
 
-def _log_connection_event(log_path: Path, label: str, status: str, detail: str = "") -> None:
-    ex = Exchange("CONNECTION", detail, status, datetime.now(UTC).isoformat(), 0.0)
+def _log_connection_event(
+    log_path: Path, label: str, status: str, detail: str = "", command: str = "CONNECTION"
+) -> None:
+    ex = Exchange(command, detail, status, datetime.now(UTC).isoformat(), 0.0)
     entry = {"stage": "connection", "state": label, "mtu": None, "mode": "record", **ex.__dict__}
-    with log_path.open("a", encoding="utf-8") as log:
-        log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _append_capture_entry(log_path, entry)
+
+
+def _record_note_sink(log_path: Path, label: str) -> Callable[[Exchange, str], None]:
+    """Writes a typed note straight to the run's capture.jsonl, independent of
+    whatever BLE connection is or isn't open at the time - `record`'s note
+    reader runs for the whole life of the run, not just while connected."""
+
+    def write(ex: Exchange, stage: str) -> None:
+        entry = {"stage": stage, "state": label, "mtu": None, "mode": "record", **ex.__dict__}
+        _append_capture_entry(log_path, entry)
+
+    return write
+
+
+def _start_sleep_inhibit(log_path: Path, label: str) -> subprocess.Popen[bytes] | None:
+    """Holds a systemd sleep/idle/lid-switch inhibitor for as long as the
+    returned process lives - BLE recording cannot survive the laptop
+    suspending. Returns None, after printing a warning, if systemd-inhibit
+    isn't on PATH or fails to start; the caller must then rely on the owner
+    keeping the machine awake manually."""
+    if shutil.which("systemd-inhibit") is None:
+        print(
+            "[record] systemd-inhibit not found; keep this machine awake manually "
+            "(disable suspend and lid-close) for the whole recording",
+            file=sys.stderr,
+        )
+        _log_connection_event(log_path, label, "UNAVAILABLE", command="SLEEP_INHIBIT")
+        return None
+    try:
+        proc = subprocess.Popen(
+            [
+                "systemd-inhibit",
+                "--what=sleep:idle:handle-lid-switch",
+                "--who=didscout",
+                "--why=recording vehicle data",
+                "--mode=block",
+                "cat",
+            ],
+            stdin=subprocess.PIPE,
+        )
+    except OSError as error:
+        print(
+            f"[record] systemd-inhibit failed to start ({error}); keep this machine awake "
+            "manually for the whole recording",
+            file=sys.stderr,
+        )
+        _log_connection_event(log_path, label, "FAILED", str(error), command="SLEEP_INHIBIT")
+        return None
+    _log_connection_event(log_path, label, "HELD", command="SLEEP_INHIBIT")
+    return proc
+
+
+def _stop_sleep_inhibit(proc: subprocess.Popen[bytes] | None) -> None:
+    if proc is None:
+        return
+    if proc.stdin is not None:
+        with contextlib.suppress(Exception):
+            proc.stdin.close()
+    proc.terminate()
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=5)
 
 
 async def record(
@@ -3050,12 +3118,15 @@ async def record(
     label: str,
     out_dir: Path,
     new: bool,
+    inhibit: bool = True,
 ) -> int:
     """Connects (scanning if no address is given), maintains a resumable run
     directory, reconnects with backoff through BLE drops, runs the one-time
     vehicle inventory (adapter, protocol, mode01, obduds, ecus11), then hands
     off to `run_record_loop`'s continuous watch/discovery scheduler, which
-    only ends on Ctrl-C (exit 130)."""
+    only ends on Ctrl-C (exit 130). A typed-note reader and (unless `inhibit`
+    is False) a sleep inhibitor both run for the whole call, independent of
+    any single BLE connection."""
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir = None if new else find_resumable_run(out_dir, label)
     if run_dir is None:
@@ -3073,100 +3144,117 @@ async def record(
     log_path = run_dir / "capture.jsonl"
     state.save(state_path)
 
+    print(
+        "(notes - type idle/drive/charge/park, or German leerlauf/fahrt/laden/parken, as phase "
+        "markers, or any other text + Enter - land timestamped in capture.jsonl any time, even "
+        "while disconnected or reconnecting)"
+    )
+    note_reader = start_note_reader(_record_note_sink(log_path, label))
+    inhibit_proc = _start_sleep_inhibit(log_path, label) if inhibit else None
+
     failures: dict[str, int] = {}
     pair_pending = True
     backoff = RECORD_INITIAL_BACKOFF
 
-    while True:
-        try:
-            resolved = state.address or await find_adapter_address()
-            if resolved != state.address:
-                state.address = resolved
-                state.save(state_path)
+    try:
+        while True:
+            try:
+                resolved = state.address or await find_adapter_address()
+                if resolved != state.address:
+                    state.address = resolved
+                    state.save(state_path)
 
-            async with connect_adapter(
-                resolved, pair_pending, log_path, label, extra_fields={"mode": "record"}
-            ) as link:
-                if link is None:
-                    return 2
-                pair_pending = False
-                _log_connection_event(log_path, label, "CONNECTED")
-                for cmd in ADAPTER_SETUP:
-                    await link.execute(cmd, "setup")
+                async with connect_adapter(
+                    resolved, pair_pending, log_path, label, extra_fields={"mode": "record"}
+                ) as link:
+                    if link is None:
+                        return 2
+                    pair_pending = False
+                    _log_connection_event(log_path, label, "CONNECTED")
+                    for cmd in ADAPTER_SETUP:
+                        await link.execute(cmd, "setup")
 
-                for stage in INVENTORY_STAGE_ORDER:
-                    if state.stage_status(stage) in ("done", "failed"):
-                        continue
+                    for stage in INVENTORY_STAGE_ORDER:
+                        if state.stage_status(stage) in ("done", "failed"):
+                            continue
+                        try:
+                            await INVENTORY_STAGE_FUNCS[stage](link, state, profile)
+                        except ProbeAbortedError as error:
+                            failures[stage] = failures.get(stage, 0) + 1
+                            link.record(
+                                Exchange(
+                                    "STAGE_FAILURE",
+                                    str(error),
+                                    "STAGE_FAILURE",
+                                    datetime.now(UTC).isoformat(),
+                                    0.0,
+                                ),
+                                stage,
+                            )
+                            if failures[stage] >= 3:
+                                state.mark_stage(stage, "failed")
+                                state.save(state_path)
+                                continue
+                            raise
+                        else:
+                            state.mark_stage(stage, "done")
+                            state.save(state_path)
+                            failures[stage] = 0
+                    else:
+                        print_inventory_summary(state)
+
                     try:
-                        await INVENTORY_STAGE_FUNCS[stage](link, state, profile)
-                    except ProbeAbortedError as error:
-                        failures[stage] = failures.get(stage, 0) + 1
+                        await run_record_loop(link, state, profile, state_path)
+                    except asyncio.CancelledError:
                         link.record(
                             Exchange(
-                                "STAGE_FAILURE",
-                                str(error),
-                                "STAGE_FAILURE",
+                                "SESSION_END",
+                                "Ctrl-C",
+                                "CANCELLED",
                                 datetime.now(UTC).isoformat(),
                                 0.0,
                             ),
-                            stage,
+                            "session",
                         )
-                        if failures[stage] >= 3:
-                            state.mark_stage(stage, "failed")
-                            state.save(state_path)
-                            continue
-                        raise
-                    else:
-                        state.mark_stage(stage, "done")
+                        for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                            if not link.session.usable:
+                                break
+                            link.record(await link.session.run(cmd), "cleanup")
+                        # finished stays False: the next `record` start resumes
+                        # discovery exactly where this run left off.
                         state.save(state_path)
-                        failures[stage] = 0
-                else:
-                    print_inventory_summary(state)
+                        try:
+                            profile_path, report_path = derive(run_dir)
+                            share_path = share(run_dir)
+                            print(f"[record] report: {report_path}")
+                            if profile_path:
+                                print(f"[record] profile draft: {profile_path}")
+                            else:
+                                print("[record] profile draft: none (no manufacturer DIDs yet)")
+                            print(f"[record] share: {share_path}")
+                            print(
+                                "[record] contribute: open a profile PR with the draft, or a "
+                                "capture PR with the share file in captures/ - see "
+                                "CONTRIBUTING.md"
+                            )
+                        except Exception as error:
+                            print(f"[record] derive/share failed: {error}", file=sys.stderr)
+                        return 130
+            except ProbeAbortedError as error:
+                _log_connection_event(log_path, label, "DISCONNECTED", str(error))
+            except Exception as error:
+                # Anything else here is a connection/transport failure (BLE connect
+                # timeout, OS-level disconnect, ...) - reconnect rather than crash.
+                _log_connection_event(log_path, label, "DISCONNECTED", str(error))
 
-                try:
-                    await run_record_loop(link, state, profile, state_path)
-                except asyncio.CancelledError:
-                    link.record(
-                        Exchange(
-                            "SESSION_END", "Ctrl-C", "CANCELLED", datetime.now(UTC).isoformat(), 0.0
-                        ),
-                        "session",
-                    )
-                    for cmd in ("ATFCSM0", "ATAR", "ATD"):
-                        if not link.session.usable:
-                            break
-                        link.record(await link.session.run(cmd), "cleanup")
-                    # finished stays False: the next `record` start resumes
-                    # discovery exactly where this run left off.
-                    state.save(state_path)
-                    try:
-                        profile_path, report_path = derive(run_dir)
-                        share_path = share(run_dir)
-                        print(f"[record] report: {report_path}")
-                        if profile_path:
-                            print(f"[record] profile draft: {profile_path}")
-                        else:
-                            print("[record] profile draft: none (no manufacturer DIDs yet)")
-                        print(f"[record] share: {share_path}")
-                        print(
-                            "[record] contribute: open a profile PR with the draft, or a capture "
-                            "PR with the share file in captures/ - see CONTRIBUTING.md"
-                        )
-                    except Exception as error:
-                        print(f"[record] derive/share failed: {error}", file=sys.stderr)
-                    return 130
-        except ProbeAbortedError as error:
-            _log_connection_event(log_path, label, "DISCONNECTED", str(error))
-        except Exception as error:
-            # Anything else here is a connection/transport failure (BLE connect
-            # timeout, OS-level disconnect, ...) - reconnect rather than crash.
-            _log_connection_event(log_path, label, "DISCONNECTED", str(error))
-
-        _log_connection_event(log_path, label, "RECONNECTING")
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 2.0, RECORD_MAX_BACKOFF)
-        if address is None:
-            state.address = None
+            _log_connection_event(log_path, label, "RECONNECTING")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, RECORD_MAX_BACKOFF)
+            if address is None:
+                state.address = None
+    finally:
+        await note_reader.stop()
+        _stop_sleep_inhibit(inhibit_proc)
 
 
 async def run_session(
@@ -3317,6 +3405,11 @@ def main(argv: list[str]) -> int:
     r.add_argument("--out", type=Path, default=Path(__file__).parent / "logs")
     r.add_argument(
         "--new", action="store_true", help="start a fresh run instead of resuming an unfinished one"
+    )
+    r.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        help="don't hold a systemd-inhibit sleep/idle lock; keep the machine awake yourself",
     )
     d = sub.add_parser(
         "derive",
@@ -3478,7 +3571,9 @@ def main(argv: list[str]) -> int:
             except ProfileError as error:
                 parser.error(str(error))
         record_label = re.sub(r"[^a-z0-9_-]", "", args.label.lower()) or "vehicle"
-        return asyncio.run(record(args.address, profile, record_label, args.out, args.new))
+        return asyncio.run(
+            record(args.address, profile, record_label, args.out, args.new, not args.no_inhibit)
+        )
     if args.mode == "derive":
         try:
             profile_path, report_path = derive(

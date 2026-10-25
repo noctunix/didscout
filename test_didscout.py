@@ -112,6 +112,21 @@ def test_sweep_still_rejects_vin_and_other_services() -> None:
             cx.check_sweep_allowed(cmd)
 
 
+def test_sweep_allows_explicit_29bit_ecu_header_and_filter() -> None:
+    assert cx.check_sweep_allowed("ATSH18DA10F1") == "ATSH18DA10F1"
+    assert cx.check_sweep_allowed("ATFCSH18DA2AF1") == "ATFCSH18DA2AF1"
+    assert cx.check_sweep_allowed("ATCRA18DAF110") == "ATCRA18DAF110"
+    assert cx.check_sweep_allowed("ATSP7") == "ATSP7"
+
+
+def test_sweep_rejects_functional_broadcast_and_other_8digit_headers() -> None:
+    # 18DB33F1 is the functional broadcast header, not a specific ECU request -
+    # sweep must only ever target one already-identified responder.
+    for cmd in ("ATSH18DB33F1", "ATFCSH18DB33F1", "ATSH12345678", "ATSHAAAAAAAA"):
+        with pytest.raises(cx.ForbiddenCommandError):
+            cx.check_sweep_allowed(cmd)
+
+
 def test_obduds_allowlist_is_read_only_and_standard_scoped() -> None:
     allowed = (
         "ATSP7",
@@ -127,6 +142,241 @@ def test_obduds_allowlist_is_read_only_and_standard_scoped() -> None:
     for cmd in ("22F802", "22F190", "22F600", "14FFFF33", "31E000", "2EF44900"):
         with pytest.raises(cx.ForbiddenCommandError):
             cx.check_obduds_allowed(cmd)
+
+
+def test_identify_allowlist_is_read_only_and_four_dids_only() -> None:
+    allowed = (
+        "ATSP7",
+        "ATSH18DB33F1",
+        "22F810",
+        "ATSH18DA10F1",
+        "ATCRA18DAF110",
+        "ATFCSH18DA10F1",
+        "22F187",
+        "22F189",
+        "22F191",
+        "22F197",
+    )
+    assert [cx.check_identify_allowed(cmd) for cmd in allowed] == list(allowed)
+    for cmd in ("22F18C", "22F190", "22F802", "22F400", "22F5FF", "14FFFF33", "2EF44900"):
+        with pytest.raises(cx.ForbiddenCommandError):
+            cx.check_identify_allowed(cmd)
+
+
+def test_sweep_header_argument_derives_protocol_and_rax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_sweep(
+        address: str,
+        header: str | None,
+        rax: str | None,
+        start: str,
+        end: str,
+        label: str,
+        out_dir: object,
+        pair: bool,
+        protocol: str | None,
+        obduds_ecus: bool = False,
+    ) -> int:
+        captured.update(
+            header=header, rax=rax, protocol=protocol, obduds_ecus=obduds_ecus
+        )
+        return 0
+
+    monkeypatch.setattr(cx, "sweep", fake_sweep)
+
+    sweep_args = ["sweep", "fake", "--header", "18da10f1", "--start", "2A00", "--end", "2A01"]
+    assert cx.main([*sweep_args, "--state", "x"]) == 0
+    assert captured == {
+        "header": "18DA10F1",
+        "rax": "18DAF110",
+        "protocol": "7",
+        "obduds_ecus": False,
+    }
+
+    captured.clear()
+    assert cx.main(
+        [
+            "sweep",
+            "fake",
+            "--header",
+            "18da10f1",
+            "--rax",
+            "18daf1aa",
+            "--start",
+            "2A00",
+            "--end",
+            "2A01",
+            "--state",
+            "x",
+        ]
+    ) == 0
+    assert captured["rax"] == "18DAF1AA"
+
+    captured.clear()
+    assert cx.main(
+        ["sweep", "fake", "--header", "710", "--start", "2A00", "--end", "2A01", "--state", "x"]
+    ) == 0
+    assert captured == {"header": "710", "rax": None, "protocol": None, "obduds_ecus": False}
+
+
+def test_sweep_obduds_ecus_enforces_max_dids_times_responder_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sent: list[str] = []
+
+    class FakeCharacteristic:
+        properties = ["write-without-response"]
+
+    class FakeServices:
+        def get_characteristic(self, _uuid: str) -> FakeCharacteristic:
+            return FakeCharacteristic()
+
+    class FakeClient:
+        mtu_size = 23
+        services = FakeServices()
+
+        def __init__(self, _address: str, *, timeout: float) -> None:
+            self.callback: Callable[[object, bytes], None] | None = None
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: TracebackType | None,
+        ) -> None:
+            pass
+
+        async def pair(self) -> None:
+            pass
+
+        async def start_notify(self, _uuid: str, callback: Callable[[object, bytes], None]) -> None:
+            self.callback = callback
+
+        async def stop_notify(self, _uuid: str) -> None:
+            pass
+
+        async def write_gatt_char(
+            self, _characteristic: FakeCharacteristic, data: bytes, *, response: bool
+        ) -> None:
+            cmd = data.decode().strip()
+            sent.append(cmd)
+            if cmd == "ATZ":
+                reply = b"OBDLINK CX\r>"
+            elif cmd == "22F810":
+                reply = b"18DAF1100462F81001\r18DAF1200462F81001\r>"
+            elif cmd.startswith("AT"):
+                reply = b"OK\r>"
+            else:
+                reply = b"NO DATA\r>"
+            assert self.callback is not None
+            self.callback(None, reply)
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    monkeypatch.setattr(cx, "MAX_SWEEP_DIDS", 1)
+    result = asyncio.run(
+        cx.sweep(
+            "fake",
+            None,
+            None,
+            "2A00",
+            "2A01",
+            "stationary",
+            tmp_path,
+            False,
+            None,
+            obduds_ecus=True,
+        )
+    )
+    assert result == 2
+    assert "222A00" not in sent
+    assert "222A01" not in sent
+
+
+def test_identify_reads_only_four_dids_and_decodes_system_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sent: list[str] = []
+
+    replies = {
+        "22F810": b"18DAF1100462F81001\r>",
+        "22F187": b"18DAF1100562F187ABCD\r>",
+        "22F189": b"18DAF1100462F18901\r>",
+        "22F191": b"18DAF1100462F19102\r>",
+        # Positive 62 F1 97 reply carrying ascii "ECU1" as the system name.
+        "22F197": b"18DAF1100762F19745435531\r>",
+    }
+
+    class FakeCharacteristic:
+        properties = ["write-without-response"]
+
+    class FakeServices:
+        def get_characteristic(self, _uuid: str) -> FakeCharacteristic:
+            return FakeCharacteristic()
+
+    class FakeClient:
+        mtu_size = 23
+        services = FakeServices()
+
+        def __init__(self, _address: str, *, timeout: float) -> None:
+            self.callback: Callable[[object, bytes], None] | None = None
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: TracebackType | None,
+        ) -> None:
+            pass
+
+        async def pair(self) -> None:
+            pass
+
+        async def start_notify(self, _uuid: str, callback: Callable[[object, bytes], None]) -> None:
+            self.callback = callback
+
+        async def stop_notify(self, _uuid: str) -> None:
+            pass
+
+        async def write_gatt_char(
+            self, _characteristic: FakeCharacteristic, data: bytes, *, response: bool
+        ) -> None:
+            cmd = data.decode().strip()
+            sent.append(cmd)
+            if cmd == "ATZ":
+                reply = b"OBDLINK CX\r>"
+            elif cmd.startswith("AT"):
+                reply = b"OK\r>"
+            else:
+                reply = replies[cmd]
+            assert self.callback is not None
+            self.callback(None, reply)
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    result = asyncio.run(cx.identify("fake", "stationary", tmp_path, False))
+
+    assert result == 0
+    assert [cmd for cmd in sent if cmd.startswith("22")] == [
+        "22F810",
+        "22F187",
+        "22F189",
+        "22F191",
+        "22F197",
+    ]
+    assert "22F18C" not in sent
+    assert "22F190" not in sent
+    assert "22F802" not in sent
+    entries = [json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text().splitlines()]
+    assert any(entry["stage"] == "identify-10" for entry in entries)
+    assert "F197=ECU1" in capsys.readouterr().out
 
 
 def test_obduds_protocol_discovery_keeps_all_nonzero_regulated_responders() -> None:

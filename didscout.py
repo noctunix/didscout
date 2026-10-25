@@ -165,9 +165,11 @@ VIN_DIDS = frozenset({"F190", "F802"})
 
 
 def check_sweep_allowed(command: str) -> str:
-    """For `sweep`: any header, but only ReadDataByIdentifier (22 xx xx) ever leaves
-    the fixed allow-list — no SID outside 0x22 can ever match, so a reset/write/
-    security service is structurally unreachable here, independent of range bounds."""
+    """For `sweep`: any 11-bit header, or an explicit 29-bit OBDonUDS ECU header/
+    filter (18DAxxF1 request, 18DAF1xx response - never the functional broadcast
+    header), but only ReadDataByIdentifier (22 xx xx) ever leaves the fixed
+    allow-list - no SID outside 0x22 can ever match, so a reset/write/security
+    service is structurally unreachable here, independent of range bounds."""
     cmd = normalize(command)
     if cmd in ALLOWED:
         return cmd
@@ -177,12 +179,20 @@ def check_sweep_allowed(command: str) -> str:
         return cmd
     if re.fullmatch(r"AT(SH|CRA|FCSH)[0-9A-F]{3}", cmd):
         return cmd
+    if re.fullmatch(r"ATSH18DA[0-9A-F]{2}F1", cmd):
+        return cmd
+    if re.fullmatch(r"ATFCSH18DA[0-9A-F]{2}F1", cmd):
+        return cmd
+    if re.fullmatch(r"ATCRA18DAF1[0-9A-F]{2}", cmd):
+        return cmd
     raise ForbiddenCommandError(cmd)
 
 
-def check_obduds_allowed(command: str) -> str:
-    """Allow only standardized, read-only OBDonUDS discovery/current-data traffic."""
-    cmd = normalize(command)
+def _obduds_transport_allowed(cmd: str) -> bool:
+    """Adapter setup, functional-request discovery header, and per-ECU 29-bit
+    header/filter commands shared by every OBDonUDS allow-list (`check_obduds_allowed`
+    and `check_identify_allowed`) - only the set of permitted 22-xx-xx data reads
+    differs between them."""
     adapter = {
         *ADAPTER_SETUP,
         "ATSP7",
@@ -194,16 +204,40 @@ def check_obduds_allowed(command: str) -> str:
         "ATFCSM1",
     }
     if cmd in adapter:
-        return cmd
+        return True
     if cmd == f"ATSH{OBDUDS_FUNCTIONAL_HEADER}" or cmd == f"22{OBDUDS_PROTOCOL_DID:04X}":
-        return cmd
+        return True
     if re.fullmatch(r"ATSH18DA[0-9A-F]{2}F1", cmd):
-        return cmd
+        return True
     if re.fullmatch(r"ATCRA18DAF1[0-9A-F]{2}", cmd):
-        return cmd
+        return True
     if re.fullmatch(r"ATFCSH18DA[0-9A-F]{2}F1", cmd):
+        return True
+    return False
+
+
+def check_obduds_allowed(command: str) -> str:
+    """Allow only standardized, read-only OBDonUDS discovery/current-data traffic."""
+    cmd = normalize(command)
+    if _obduds_transport_allowed(cmd):
         return cmd
     if re.fullmatch(r"22F[45][0-9A-F]{2}", cmd):
+        return cmd
+    raise ForbiddenCommandError(cmd)
+
+
+# Spare part number, software version, hardware number, system name - never the
+# serial number (F18C) or any VIN.
+IDENTIFY_DIDS = frozenset({"F187", "F189", "F191", "F197"})
+
+
+def check_identify_allowed(command: str) -> str:
+    """Allow only OBDonUDS discovery/header setup plus the four ECU identification
+    reads in IDENTIFY_DIDS - never the serial number or any VIN DID."""
+    cmd = normalize(command)
+    if _obduds_transport_allowed(cmd):
+        return cmd
+    if cmd.startswith("22") and cmd[2:] in IDENTIFY_DIDS:
         return cmd
     raise ForbiddenCommandError(cmd)
 
@@ -366,6 +400,17 @@ def obduds_responders(response: str) -> list[str]:
         and payload[3] == 1
     }
     return sorted(responders)
+
+
+def decode_positive_payload(command: str, response: str, responder: str) -> bytes | None:
+    """Returns the data bytes of a positive ReadDataByIdentifier reply from one
+    responder, or None if no matching positive response was found."""
+    expected = bytes.fromhex(command)
+    prefix = bytes([expected[0] + 0x40]) + expected[1:]
+    for header, message in parse_isotp(command, response).messages:
+        if _responder_matches(header, responder) and message.startswith(prefix):
+            return message[len(prefix) :]
+    return None
 
 
 def obduds_supported_dids(command: str, response: str, responder: str) -> set[int]:
@@ -700,9 +745,43 @@ async def sweep_range(
     return hits
 
 
+async def obduds_discover(
+    execute: Callable[[str, str, str | None], Awaitable[Exchange]],
+) -> list[str]:
+    """Runs the SAE J1979-2 functional-request discovery (ATSP7, functional header,
+    22F810) and returns the positively-identifying 29-bit responders. Shared by
+    `obduds_probe`, `identify`, and `sweep --obduds-ecus`."""
+    await execute("ATSP7", "obduds-setup", None)
+    await execute("ATDPN", "obduds-setup", None)
+    await execute("ATAR", "obduds-setup", None)
+    await execute(f"ATSH{OBDUDS_FUNCTIONAL_HEADER}", "obduds-setup", None)
+    protocol = await execute(
+        f"22{OBDUDS_PROTOCOL_DID:04X}", "obduds-discovery", OBDUDS_RESPONDER_PATTERN
+    )
+    return obduds_responders(protocol.response)
+
+
+async def obduds_select_responder(
+    execute: Callable[[str, str, str | None], Awaitable[Exchange]],
+    responder: str,
+    stage: str,
+) -> str:
+    """Sets header/filter/flow-control for one 29-bit OBDonUDS responder, exactly as
+    `obduds_probe` does; returns the responder's two-hex ECU id. Shared by
+    `obduds_probe`, `identify`, and `sweep --obduds-ecus`."""
+    ecu = responder[-2:]
+    request = f"18DA{ecu}F1"
+    await execute(f"ATSH{request}", stage, None)
+    await execute(f"ATCRA{responder}", stage, None)
+    await execute(f"ATFCSH{request}", stage, None)
+    await execute("ATFCSD300000", stage, None)
+    await execute("ATFCSM1", stage, None)
+    return ecu
+
+
 async def sweep(
     address: str,
-    header: str,
+    header: str | None,
     rax: str | None,
     start: str,
     end: str,
@@ -710,10 +789,12 @@ async def sweep(
     out_dir: Path,
     pair: bool,
     protocol: str | None,
+    obduds_ecus: bool = False,
 ) -> int:
-    """Brute-forces ReadDataByIdentifier (22 xx xx) over [start, end] at one header.
-    Only service 0x22 ever leaves check_sweep_allowed, so this can't drift into a
-    write/reset/security service regardless of the DID range."""
+    """Brute-forces ReadDataByIdentifier (22 xx xx) over [start, end], either at one
+    fixed header or, with `obduds_ecus`, at every regulated 29-bit ECU discovered via
+    SAE J1979-2. Only service 0x22 ever leaves check_sweep_allowed, so this can't
+    drift into a write/reset/security service regardless of the DID range."""
     from bleak import BleakClient
 
     start_i, end_i = int(start, 16), int(end, 16)
@@ -721,7 +802,7 @@ async def sweep(
         print("--start/--end must be 0000-FFFF with start <= end", file=sys.stderr)
         return 2
     count = end_i - start_i + 1
-    if count > MAX_SWEEP_DIDS:
+    if not obduds_ecus and count > MAX_SWEEP_DIDS:
         print(
             f"{count} DIDs exceeds MAX_SWEEP_DIDS ({MAX_SWEEP_DIDS}) - split the range",
             file=sys.stderr,
@@ -730,7 +811,8 @@ async def sweep(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = out_dir / f"didscout_{stamp}_{label}_sweep{header}.jsonl"
+    suffix = "obduds-ecus" if obduds_ecus else header
+    log_path = out_dir / f"didscout_{stamp}_{label}_sweep{suffix}.jsonl"
 
     async with BleakClient(address, timeout=20.0) as client:
         if pair:
@@ -756,26 +838,73 @@ async def sweep(
                 status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
                 print(f"{status}  {first[:60]}")
 
-            for cmd in ADAPTER_SETUP:
-                record(await session.run(cmd), "setup")
-            record(await session.run(FORCE_PROTOCOL[protocol] if protocol else "ATSP0"), "setup")
-            record(await session.run(f"ATSH{header}", check_sweep_allowed), "setup")
-            if rax:
-                record(await session.run(f"ATCRA{rax}", check_sweep_allowed), "setup")
-                record(await session.run(f"ATFCSH{header}", check_sweep_allowed), "setup")
-                record(await session.run("ATFCSD300000"), "setup")
-                record(await session.run("ATFCSM1"), "setup")
+            if obduds_ecus:
+                result = 0
+                hits: list[tuple[str, str]] = []
 
-            hits = await sweep_range(session, record, start_i, end_i, responder=rax)
+                async def execute(
+                    command: str, stage: str, responder: str | None = None
+                ) -> Exchange:
+                    ex = await session.run(command, check_obduds_allowed, responder)
+                    record(ex, stage)
+                    critical = command.startswith("AT") and command != "ATDPN"
+                    if not session.usable or (critical and ex.status != "OK"):
+                        raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
+                    return ex
 
-            if rax:
-                record(await session.run("ATFCSM0"), "cleanup")
-            record(await session.run("ATAR"), "cleanup")
-            record(await session.run("ATD"), "cleanup")
+                try:
+                    for cmd in ADAPTER_SETUP:
+                        await execute(cmd, "setup")
+                    responders = await obduds_discover(execute)
+                    print(f"[sweep] regulated responders: {' '.join(responders) or '-'}")
+                    if not responders:
+                        result = 2
+                    elif count * len(responders) > MAX_SWEEP_DIDS:
+                        print(
+                            f"{count} DIDs x {len(responders)} ECUs exceeds MAX_SWEEP_DIDS "
+                            f"({MAX_SWEEP_DIDS}) - split the range",
+                            file=sys.stderr,
+                        )
+                        result = 2
+                    else:
+                        for responder in responders:
+                            ecu = await obduds_select_responder(execute, responder, "setup")
+                            hits.extend(
+                                await sweep_range(
+                                    session, record, start_i, end_i, f"sweep-{ecu}", responder
+                                )
+                            )
+                except ProbeAbortedError as error:
+                    print(f"sweep --obduds-ecus aborted: {error}", file=sys.stderr)
+                    result = 2
+                finally:
+                    if session.usable:
+                        for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                            record(await session.run(cmd, check_obduds_allowed), "cleanup")
+            else:
+                result = 0
+                for cmd in ADAPTER_SETUP:
+                    record(await session.run(cmd), "setup")
+                record(
+                    await session.run(FORCE_PROTOCOL[protocol] if protocol else "ATSP0"), "setup"
+                )
+                record(await session.run(f"ATSH{header}", check_sweep_allowed), "setup")
+                if rax:
+                    record(await session.run(f"ATCRA{rax}", check_sweep_allowed), "setup")
+                    record(await session.run(f"ATFCSH{header}", check_sweep_allowed), "setup")
+                    record(await session.run("ATFCSD300000"), "setup")
+                    record(await session.run("ATFCSM1"), "setup")
+
+                hits = await sweep_range(session, record, start_i, end_i, responder=rax)
+
+                if rax:
+                    record(await session.run("ATFCSM0"), "cleanup")
+                record(await session.run("ATAR"), "cleanup")
+                record(await session.run("ATD"), "cleanup")
         await client.stop_notify(UART_NOTIFY)
     print(f"log: {log_path}")
     print(f"hits: {hits or '-'}")
-    return 0
+    return result
 
 
 async def obduds_probe(
@@ -828,28 +957,13 @@ async def obduds_probe(
             try:
                 for cmd in ADAPTER_SETUP:
                     await execute(cmd, "obduds-setup")
-                await execute("ATSP7", "obduds-setup")
-                await execute("ATDPN", "obduds-setup")
-                await execute("ATAR", "obduds-setup")
-                await execute(f"ATSH{OBDUDS_FUNCTIONAL_HEADER}", "obduds-setup")
-                protocol = await execute(
-                    f"22{OBDUDS_PROTOCOL_DID:04X}",
-                    "obduds-discovery",
-                    OBDUDS_RESPONDER_PATTERN,
-                )
-                responders = obduds_responders(protocol.response)
+                responders = await obduds_discover(execute)
                 print(f"[obduds] regulated responders: {' '.join(responders) or '-'}")
                 if not responders:
                     result = 2
 
                 for responder in responders:
-                    ecu = responder[-2:]
-                    request = f"18DA{ecu}F1"
-                    await execute(f"ATSH{request}", "obduds-setup")
-                    await execute(f"ATCRA{responder}", "obduds-setup")
-                    await execute(f"ATFCSH{request}", "obduds-setup")
-                    await execute("ATFCSD300000", "obduds-setup")
-                    await execute("ATFCSM1", "obduds-setup")
+                    ecu = await obduds_select_responder(execute, responder, "obduds-setup")
 
                     supported: set[int] = set()
                     base = OBDUDS_FIRST_SUPPORT_DID
@@ -887,6 +1001,90 @@ async def obduds_probe(
                     for cmd in ("ATFCSM0", "ATAR", "ATD"):
                         ex = await session.run(cmd, check_obduds_allowed)
                         record(ex, "obduds-cleanup")
+                await client.stop_notify(UART_NOTIFY)
+    print(f"log: {log_path}")
+    return result
+
+
+async def identify(
+    address: str,
+    label: str,
+    out_dir: Path,
+    pair: bool,
+) -> int:
+    """Discover regulated 29-bit OBDonUDS ECUs, then read only each one's spare part
+    number, software version, hardware number, and system name (never the serial
+    number or any VIN) via check_identify_allowed."""
+    from bleak import BleakClient
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = out_dir / f"didscout_{stamp}_{label}_identify.jsonl"
+    result = 0
+
+    async with BleakClient(address, timeout=20.0) as client:
+        if pair:
+            await client.pair()
+        chunk = max(20, client.mtu_size - 3)
+        write_char = client.services.get_characteristic(UART_WRITE)
+        if write_char is None:
+            print("UART write characteristic not found - wrong device?", file=sys.stderr)
+            return 2
+        with_response = "write-without-response" not in write_char.properties
+        session = ElmSession(
+            lambda data: client.write_gatt_char(write_char, data, response=with_response), chunk
+        )
+        await client.start_notify(UART_NOTIFY, lambda _c, data: session.on_notify(bytes(data)))
+
+        with log_path.open("a", encoding="utf-8") as log:
+
+            def record(ex: Exchange, stage: str) -> None:
+                entry = {"stage": stage, "state": label, "mtu": client.mtu_size, **ex.__dict__}
+                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                log.flush()
+                first = ex.response.splitlines()[0] if ex.response else ""
+                status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
+                print(f"{status}  {first[:60]}")
+
+            async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
+                ex = await session.run(command, check_identify_allowed, responder)
+                record(ex, stage)
+                critical = command.startswith("AT") and command != "ATDPN"
+                if not session.usable or (critical and ex.status != "OK"):
+                    raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
+                return ex
+
+            try:
+                for cmd in ADAPTER_SETUP:
+                    await execute(cmd, "identify-setup")
+                responders = await obduds_discover(execute)
+                print(f"[identify] regulated responders: {' '.join(responders) or '-'}")
+                if not responders:
+                    result = 2
+
+                for responder in responders:
+                    ecu = await obduds_select_responder(execute, responder, "identify-setup")
+                    summary: list[str] = []
+                    for did in sorted(IDENTIFY_DIDS):
+                        command = f"22{did}"
+                        ex = await execute(command, f"identify-{ecu}", responder)
+                        if did == "F197" and ex.status == "OK":
+                            payload = decode_positive_payload(command, ex.response, responder)
+                            value = (
+                                payload.decode("ascii", errors="replace") if payload else ex.status
+                            )
+                        else:
+                            value = ex.status
+                        summary.append(f"{did}={value}")
+                    print(f"[identify {responder}] " + " ".join(summary))
+            except ProbeAbortedError as error:
+                print(f"identify aborted: {error}", file=sys.stderr)
+                result = 2
+            finally:
+                if session.usable:
+                    for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                        ex = await session.run(cmd, check_identify_allowed)
+                        record(ex, "identify-cleanup")
                 await client.stop_notify(UART_NOTIFY)
     print(f"log: {log_path}")
     return result
@@ -1082,9 +1280,20 @@ def main(argv: list[str]) -> int:
         "header - read-only, never any other service, see check_sweep_allowed",
     )
     w.add_argument("address", help="BLE address from `scan`")
-    w.add_argument("--header", required=True, help="3-hex-digit request header, e.g. 710")
     w.add_argument(
-        "--rax", help="3-hex-digit response id (ATCRA), e.g. 77A; omit if unknown for this header"
+        "--header",
+        help="3-hex-digit (11-bit) or 18DAxxF1 (29-bit) request header; omit with --obduds-ecus",
+    )
+    w.add_argument(
+        "--rax",
+        help="response id (ATCRA): 3 hex digits, or 18DAF1xx for a 29-bit --header; omit if "
+        "unknown (11-bit) or to use the derived default (29-bit)",
+    )
+    w.add_argument(
+        "--obduds-ecus",
+        action="store_true",
+        help="discover regulated 29-bit OBDonUDS ECUs (as `obduds` does) and sweep the range "
+        "at each one instead of a fixed --header/--rax",
     )
     w.add_argument("--start", required=True, help="first DID, 4 hex digits, e.g. 2A00")
     w.add_argument("--end", required=True, help="last DID, inclusive, 4 hex digits, e.g. 2AFF")
@@ -1118,6 +1327,19 @@ def main(argv: list[str]) -> int:
         "--support-only",
         action="store_true",
         help="stop after each ECU's chained F400/F420/... support bitmaps",
+    )
+    ident = sub.add_parser(
+        "identify",
+        help="discover regulated 29-bit OBDonUDS ECUs and read only their part/software/"
+        "hardware numbers and system name - never the serial number or VIN",
+    )
+    ident.add_argument("address", help="BLE address from `scan`")
+    ident.add_argument(
+        "--state", required=True, help="vehicle state label, e.g. ignitionOn, stationary, charging"
+    )
+    ident.add_argument("--out", type=Path, default=Path(__file__).parent / "logs")
+    ident.add_argument(
+        "--pair", action="store_true", help="bond first (within 5 min of plugging in the adapter)"
     )
     n = sub.add_parser(
         "session",
@@ -1158,18 +1380,52 @@ def main(argv: list[str]) -> int:
         return asyncio.run(
             obduds_probe(args.address, label, args.out, args.pair, args.support_only)
         )
+    if args.mode == "identify":
+        return asyncio.run(identify(args.address, label, args.out, args.pair))
     if args.mode == "sweep":
+        if args.obduds_ecus:
+            if args.header or args.rax:
+                parser.error("--obduds-ecus is mutually exclusive with --header/--rax")
+            return asyncio.run(
+                sweep(
+                    args.address,
+                    None,
+                    None,
+                    args.start,
+                    args.end,
+                    label,
+                    args.out,
+                    args.pair,
+                    None,
+                    obduds_ecus=True,
+                )
+            )
+        if not args.header:
+            parser.error("--header is required unless --obduds-ecus is given")
+        header = args.header.upper()
+        rax = args.rax.upper() if args.rax else None
+        protocol = args.protocol
+        if len(header) == 8:
+            if not re.fullmatch(r"18DA[0-9A-F]{2}F1", header):
+                parser.error("an 8-digit --header must match 18DAxxF1")
+            if args.protocol == "6":
+                parser.error("--header 18DAxxF1 is 29-bit CAN; incompatible with --protocol 6")
+            protocol = "7"
+            if rax is None:
+                rax = f"18DAF1{header[4:6]}"
+        elif len(header) != 3:
+            parser.error("--header must be 3 hex digits or 18DAxxF1")
         return asyncio.run(
             sweep(
                 args.address,
-                args.header.upper(),
-                args.rax.upper() if args.rax else None,
+                header,
+                rax,
                 args.start,
                 args.end,
                 label,
                 args.out,
                 args.pair,
-                args.protocol,
+                protocol,
             )
         )
     if args.mode == "session":

@@ -13,11 +13,14 @@ Every command passes an allow-list validator before it is sent, and the three
 modes have three different, narrower allow-lists:
 
 - `sweep` can only emit UDS ReadDataByIdentifier (`0x22`) plus header/filter `AT`
-  commands (`ATSH`, `ATCRA`, `ATFCSH`) — brute-forcing a DID range never reaches
-  any other service, independent of the range given.
+  commands (`ATSH`, `ATCRA`, `ATFCSH`, including the 29-bit `18DAxxF1`/`18DAF1xx`
+  forms) — brute-forcing a DID range never reaches any other service, independent
+  of the range given.
 - `obduds` only follows SAE J1979-2 discovery: a functional request (`22F810`),
   then each responding ECU's own support bitmaps (`F400`, `F420`, ...), and reads
   only the DIDs those bitmaps announce (`F4xx`/`F5xx`).
+- `identify` follows the same discovery but reads only four fixed identification
+  DIDs (`F187`, `F189`, `F191`, `F197`) per ECU — never the serial number (`F18C`).
 - VIN DIDs (`F190`, `F802`) are never read, in any mode.
 
 No write, clear-DTC, routine-control, security-access, session-control, or reset
@@ -61,6 +64,20 @@ Brute-force `ReadDataByIdentifier` over a bounded DID range at one CAN header:
 uv run python didscout.py sweep <ADDRESS> --header 710 --start 2A00 --end 2AFF --state stationary
 ```
 
+`--header` also accepts a 29-bit ECU request header (`18DAxxF1`); this forces
+protocol 7 and defaults `--rax` to the matching `18DAF1xx` response id:
+
+```
+uv run python didscout.py sweep <ADDRESS> --header 18DA10F1 --start F400 --end F4FF --state stationary
+```
+
+`--obduds-ecus` discovers all regulated 29-bit ECUs (as `obduds` does) and runs the
+same range sweep at every one of them, instead of a fixed `--header`:
+
+```
+uv run python didscout.py sweep <ADDRESS> --obduds-ecus --start F400 --end F4FF --state stationary
+```
+
 ### `obduds`
 
 Safely discover SAE J1979-2/-3 (OBDonUDS) ECUs and read only their advertised
@@ -68,6 +85,16 @@ current-data DIDs:
 
 ```
 uv run python didscout.py obduds <ADDRESS> --state stationary
+```
+
+### `identify`
+
+Discover regulated 29-bit ECUs and read only their spare part number, software
+version, hardware number, and system name - never the serial number or any VIN.
+Identification responses contain part/software numbers and stay in local logs only:
+
+```
+uv run python didscout.py identify <ADDRESS> --state stationary
 ```
 
 ### `session`

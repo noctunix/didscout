@@ -19,7 +19,7 @@ import threading
 import time
 import tomllib
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -194,6 +194,23 @@ def check_mode01_allowed(command: str) -> str:
     if re.fullmatch(r"01[0-9A-F]{2}", cmd):
         return cmd
     raise ForbiddenCommandError(cmd)
+
+
+# The mode-01 functional broadcast header for each CAN protocol - `record`'s
+# continuous loop needs to reset to this after another module's setup pointed
+# ATSH at a specific ECU.
+MODE01_FUNCTIONAL_HEADER = {"6": "7DF", "7": OBDUDS_FUNCTIONAL_HEADER}
+
+
+def check_mode01_watch_allowed(command: str) -> str:
+    """`check_mode01_allowed` plus the header reset `record`'s continuous loop
+    needs between polling a specific ECU and polling mode 01 - still only
+    adapter/header setup and `01xx` reads, never anything that could reach a
+    write/reset/security service."""
+    cmd = normalize(command)
+    if cmd in {f"ATSH{header}" for header in MODE01_FUNCTIONAL_HEADER.values()}:
+        return cmd
+    return check_mode01_allowed(cmd)
 
 
 # Broad adapter receive filter/mask that accepts any 11-bit id in 0x700-0x7FF,
@@ -1545,7 +1562,10 @@ class RunState:
         self.data["finished"] = True
 
     def _section(self, key: str) -> dict[str, object]:
-        section = self.data[key]
+        # setdefault rather than a plain lookup: a state.json saved before the
+        # continuous loop existed has no "discovery" section yet, and should
+        # still load rather than needing a schema migration.
+        section = self.data.setdefault(key, {})
         assert isinstance(section, dict)
         return section
 
@@ -1561,6 +1581,27 @@ class RunState:
 
     def set_result(self, key: str, value: object) -> None:
         self._section("results")[key] = value
+
+    def discovery_state(self, module_key: str) -> tuple[int, list[str], list[str]]:
+        """(position, discovered DIDs, conditional DIDs) persisted for one
+        continuous-loop module, or (0, [], []) if discovery hasn't touched it yet."""
+        info = self._section("discovery").get(module_key)
+        if not isinstance(info, dict):
+            return 0, [], []
+        return (
+            int(info.get("position", 0)),
+            list(info.get("discovered", [])),
+            list(info.get("conditional", [])),
+        )
+
+    def save_discovery_state(
+        self, module_key: str, position: int, discovered: list[str], conditional: list[str]
+    ) -> None:
+        self._section("discovery")[module_key] = {
+            "position": position,
+            "discovered": sorted(discovered),
+            "conditional": sorted(conditional),
+        }
 
 
 RECORD_RUN_DIR_PATTERN = re.compile(r"record_(\d{8}_\d{6})_(.+)")
@@ -1801,6 +1842,470 @@ def print_inventory_summary(state: RunState) -> None:
         print("  11-bit ECUs: none found")
 
 
+# `record`'s continuous loop, after the inventory: keeps polling everything it
+# already knows about and, while the vehicle is stationary, discovers further
+# DIDs on every known ECU in the background - until Ctrl-C.
+RECORD_LOAD_LIMIT = 4.0  # max summed watch-poll rate, reads/second
+RECORD_SPEED_INTERVAL = 2.0
+RECORD_SPEED_MAX_AGE = 10.0
+RECORD_MODE01_WATCH_INTERVAL = 10.0
+RECORD_OBDUDS_WATCH_INTERVAL = 10.0
+RECORD_DISCOVERED_WATCH_INTERVAL = 30.0
+RECORD_DISCOVERY_BATCH = 16
+RECORD_STATUS_INTERVAL = 10.0
+
+# Discovery DID order, per module: a module's own profile `discover` ranges
+# first, then the standardized ranges most likely to answer, then the rest of
+# the DID space ascending.
+DISCOVERY_PRIORITY_RANGES = ((0xF180, 0xF1FF), (0x0100, 0x0FFF), (0x1000, 0x1FFF), (0x2000, 0x2FFF))
+# F4xx/F5xx and F8xx stay announcement-only via OBDonUDS (see _inventory_obduds);
+# never offered to the generic per-ECU discovery scan.
+DISCOVERY_EXCLUDED_RANGES = ((0xF400, 0xF5FF), (0xF800, 0xF8FF))
+DISCOVERY_FULL_RANGE = (0x0000, 0xFFFF)
+
+
+def discovery_did_order(profile_ranges: list[tuple[int, int]]) -> list[int]:
+    """The DID scan order for one module's background discovery - skipping VIN
+    DIDs, the serial number, and the OBDonUDS-only standardized ranges
+    (DISCOVERY_EXCLUDED_RANGES), and never visiting the same DID twice even if
+    it falls in more than one range."""
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def add_range(start: int, end: int) -> None:
+        for did in range(start, end + 1):
+            if did in seen:
+                continue
+            seen.add(did)
+            hex_did = f"{did:04X}"
+            if hex_did in VIN_DIDS or hex_did == "F18C":
+                continue
+            if any(lo <= did <= hi for lo, hi in DISCOVERY_EXCLUDED_RANGES):
+                continue
+            ordered.append(did)
+
+    for start, end in profile_ranges:
+        add_range(start, end)
+    for start, end in DISCOVERY_PRIORITY_RANGES:
+        add_range(start, end)
+    add_range(*DISCOVERY_FULL_RANGE)
+    return ordered
+
+
+def stretch_watch_intervals[K](
+    entries: list[tuple[K, float, bool]], limit: float = RECORD_LOAD_LIMIT
+) -> dict[K, float]:
+    """Scales every non-speed interval in `entries` (key, base interval,
+    is_speed) up proportionally so the summed poll rate fits `limit` reads per
+    second - the speed source is exempt, since motion gating depends on it
+    staying fresh."""
+    rate = sum(1.0 / interval for _key, interval, is_speed in entries if not is_speed)
+    factor = max(1.0, rate / limit) if rate else 1.0
+    return {
+        key: (interval if is_speed else interval * factor) for key, interval, is_speed in entries
+    }
+
+
+def motion_phase(speed: int | None, age: float | None) -> str:
+    """'stationary' only for a fresh (<= RECORD_SPEED_MAX_AGE), successful,
+    zero speed reading - no speed source, a failed read, or a stale one all
+    count as 'moving' so discovery never runs blind to motion."""
+    if speed is None or age is None or age > RECORD_SPEED_MAX_AGE:
+        return "moving"
+    return "stationary" if speed == 0 else "moving"
+
+
+def decode_speed(command: str, ex: Exchange, responder: str | None) -> int | None:
+    """Decodes a speed reading (km/h) from a positive mode-01 010D or OBDonUDS
+    22F40D exchange, or None if it wasn't a usable positive reply."""
+    if ex.status != "OK":
+        return None
+    if command == "010D":
+        match = re.search(r"410D([0-9A-F]{2})", re.sub(r"\s+", "", ex.response.upper()))
+        return int(match.group(1), 16) if match else None
+    if responder is not None:
+        payload = decode_positive_payload(command, ex.response, responder)
+        return payload[0] if payload else None
+    return None
+
+
+@dataclass
+class RecordModule:
+    """One ECU `record`'s continuous loop can poll and discover on - a profile
+    module, an `_inventory_ecus11` ECU, or an `_inventory_obduds` responder,
+    normalized to the same setup/validator shape so the scheduler treats them
+    identically. `discover_ranges` is None for the one module (mode 01) that
+    isn't discoverable at all."""
+
+    key: str
+    setup: list[str]
+    validator: Callable[[str], str]
+    responder: str | None
+    discover_ranges: list[tuple[int, int]] | None
+    order: list[int] = field(default_factory=list)
+    position: int = 0
+    discovered: set[int] = field(default_factory=set)
+    conditional: set[int] = field(default_factory=set)
+    retry_queue: list[int] = field(default_factory=list)
+
+    @property
+    def discoverable(self) -> bool:
+        return self.discover_ranges is not None
+
+    def has_discovery_work(self) -> bool:
+        return self.discoverable and (self.position < len(self.order) or bool(self.retry_queue))
+
+
+@dataclass
+class RecordWatch:
+    module_key: str
+    command: str
+    base_interval: float
+    stage: str
+    is_speed: bool = False
+
+
+def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, RecordModule]:
+    """Every module `record`'s continuous loop knows about after the
+    inventory: a synthetic mode-01 module (if a protocol was chosen), every
+    profile module, every ECU `_inventory_ecus11` found, and every responder
+    `_inventory_obduds` found - each with its discovery progress restored from
+    `state`."""
+    modules: dict[str, RecordModule] = {}
+    protocol = state.result("protocol") or {}
+    chosen = protocol.get("chosen") if isinstance(protocol, dict) else None
+    if chosen in MODE01_FUNCTIONAL_HEADER:
+        header = MODE01_FUNCTIONAL_HEADER[chosen]
+        modules["mode01"] = RecordModule(
+            key="mode01",
+            setup=["ATFCSM0", "ATAR", f"ATSH{header}"],
+            validator=check_mode01_watch_allowed,
+            responder=None,
+            discover_ranges=None,
+        )
+
+    if profile is not None:
+        for pm in profile.modules:
+            key = f"profile:{pm.id}"
+            modules[key] = RecordModule(
+                key=key,
+                setup=module_setup_commands(pm),
+                validator=check_sweep_allowed,
+                responder=pm.response,
+                discover_ranges=[
+                    (int(start, 16), int(end, 16)) for start, end in (pm.discover or [])
+                ],
+            )
+
+    ecus11 = state.result("ecus11") or {}
+    if isinstance(ecus11, dict):
+        for request, info in ecus11.items():
+            assert isinstance(info, dict)
+            response = info.get("response")
+            assert isinstance(response, str)
+            key = f"ecus11:{request}"
+            synthetic = Module(id=key, request=request, dids=[], response=response)
+            modules[key] = RecordModule(
+                key=key,
+                setup=module_setup_commands(synthetic),
+                validator=check_sweep_allowed,
+                responder=response,
+                discover_ranges=[],
+            )
+
+    obduds = state.result("obduds") or {}
+    if isinstance(obduds, dict):
+        for responder, info in obduds.items():
+            assert isinstance(info, dict)
+            key = f"obduds:{responder}"
+            request = f"18DA{responder[-2:]}F1"
+            synthetic = Module(id=key, request=request, dids=[], response=responder)
+            modules[key] = RecordModule(
+                key=key,
+                setup=module_setup_commands(synthetic),
+                validator=check_sweep_allowed,
+                responder=responder,
+                discover_ranges=[],
+            )
+
+    for key, module in modules.items():
+        if not module.discoverable:
+            continue
+        position, discovered, conditional = state.discovery_state(key)
+        module.order = discovery_did_order(module.discover_ranges or [])
+        module.position = min(position, len(module.order))
+        module.discovered = {int(did, 16) for did in discovered}
+        module.conditional = {int(did, 16) for did in conditional}
+    return modules
+
+
+def select_speed_source(
+    modules: dict[str, RecordModule], state: RunState
+) -> tuple[str, str] | None:
+    """The speed source `record`'s motion gating polls every
+    RECORD_SPEED_INTERVAL seconds: mode-01 010D if supported, else the first
+    (by responder id) OBDonUDS responder that announces F40D, else None - no
+    speed source means discovery always stays paused."""
+    mode01 = state.result("mode01") or {}
+    supported = mode01.get("supported_pids", []) if isinstance(mode01, dict) else []
+    if "mode01" in modules and "0D" in supported:
+        return "mode01", "010D"
+    obduds = state.result("obduds") or {}
+    if isinstance(obduds, dict):
+        for responder, info in sorted(obduds.items()):
+            assert isinstance(info, dict)
+            if "F40D" in info.get("supported_dids", []):
+                return f"obduds:{responder}", "22F40D"
+    return None
+
+
+def build_record_watch(
+    profile: Profile | None,
+    state: RunState,
+    modules: dict[str, RecordModule],
+    speed_key: tuple[str, str] | None,
+) -> list[RecordWatch]:
+    """Every value `record`'s continuous loop polls on a fixed schedule: the
+    speed source (if any), every profile watch/survey DID at its own interval,
+    every supported mode-01 PID and every OBDonUDS announced data DID (10 s
+    each), and every DID a previous discovery run already found (30 s each) -
+    see RECORD_*_WATCH_INTERVAL."""
+    watch: list[RecordWatch] = []
+    if speed_key is not None:
+        watch.append(RecordWatch(speed_key[0], speed_key[1], RECORD_SPEED_INTERVAL, "speed", True))
+
+    mode01 = state.result("mode01") or {}
+    supported = mode01.get("supported_pids", []) if isinstance(mode01, dict) else []
+    if "mode01" in modules:
+        for pid in supported:
+            command = f"01{pid}"
+            if speed_key == ("mode01", command):
+                continue
+            watch.append(RecordWatch("mode01", command, RECORD_MODE01_WATCH_INTERVAL, "watch"))
+
+    if profile is not None:
+        for pm in profile.modules:
+            module_key = f"profile:{pm.id}"
+            for did in pm.dids:
+                if did.poll in ("watch", "survey"):
+                    assert did.interval is not None
+                    watch.append(RecordWatch(module_key, f"22{did.did}", did.interval, "watch"))
+
+    obduds = state.result("obduds") or {}
+    if isinstance(obduds, dict):
+        for responder, info in obduds.items():
+            assert isinstance(info, dict)
+            module_key = f"obduds:{responder}"
+            for did in info.get("supported_dids", []):
+                command = f"22{did}"
+                if speed_key == (module_key, command):
+                    continue
+                entry = RecordWatch(module_key, command, RECORD_OBDUDS_WATCH_INTERVAL, "watch")
+                watch.append(entry)
+
+    for key, module in modules.items():
+        if not module.discoverable:
+            continue
+        for discovered_did in sorted(module.discovered):
+            entry = RecordWatch(
+                key, f"22{discovered_did:04X}", RECORD_DISCOVERED_WATCH_INTERVAL, "watch"
+            )
+            watch.append(entry)
+
+    return watch
+
+
+async def run_discovery_batch(
+    link: AdapterLink, module: RecordModule, state: RunState, state_path: Path
+) -> list[int]:
+    """Reads one batch (RECORD_DISCOVERY_BATCH DIDs) of `module`'s discovery
+    work - its pending conditional retries first, else the next slice of its
+    scan order - persists the updated position/discovered/conditional set, and
+    returns the DIDs newly found OK in this batch."""
+    if module.retry_queue:
+        batch, module.retry_queue = (
+            module.retry_queue[:RECORD_DISCOVERY_BATCH],
+            module.retry_queue[RECORD_DISCOVERY_BATCH:],
+        )
+    else:
+        batch = module.order[module.position : module.position + RECORD_DISCOVERY_BATCH]
+        module.position += len(batch)
+
+    stage = f"discover-{module.key}"
+    newly_found: list[int] = []
+    for did in batch:
+        ex = await link.execute(f"22{did:04X}", stage, module.validator, module.responder)
+        if ex.status == "OK":
+            module.discovered.add(did)
+            module.conditional.discard(did)
+            newly_found.append(did)
+        elif ex.status in ("NRC 22 conditionsNotCorrect", "NRC 33 securityAccessDenied"):
+            module.conditional.add(did)
+        else:
+            module.conditional.discard(did)
+
+    state.save_discovery_state(
+        module.key,
+        module.position,
+        [f"{did:04X}" for did in module.discovered],
+        [f"{did:04X}" for did in module.conditional],
+    )
+    state.save(state_path)
+    return newly_found
+
+
+def record_status_line(
+    phase: str, watching: int, modules: dict[str, RecordModule], discovery_rate: float
+) -> str:
+    parts = [f"phase={phase}", f"watching={watching}"]
+    for key, module in sorted(modules.items()):
+        if not module.discoverable:
+            continue
+        total = len(module.order)
+        pct = 100.0 if total == 0 else module.position / total * 100
+        remaining = total - module.position
+        eta = f"{remaining / discovery_rate:.0f}s" if discovery_rate > 0 and remaining else "-"
+        parts.append(f"{key}={pct:.0f}%(eta {eta})")
+    return " ".join(parts)
+
+
+@dataclass
+class RecordLoopState:
+    """Everything `record_loop_tick` carries between iterations - split out of
+    `run_record_loop` so a test can drive one tick at a time instead of racing
+    a background task against real wall-clock intervals."""
+
+    modules: dict[str, RecordModule]
+    speed_key: tuple[str, str] | None
+    by_key: dict[tuple[str, str], RecordWatch]
+    next_due: dict[tuple[str, str], float]
+    latest: dict[str, LiveValue] = field(default_factory=dict)
+    current_module_key: str | None = None
+    phase: str = "moving"
+    speed_value: int | None = None
+    speed_fetched: float | None = None
+    discovery_start: float = field(default_factory=time.monotonic)
+    discovery_done_initial: int = 0
+    last_status: float = field(default_factory=time.monotonic)
+
+    def current_phase(self) -> str:
+        if self.speed_key is None:
+            return "moving"
+        age = None if self.speed_fetched is None else time.monotonic() - self.speed_fetched
+        return motion_phase(self.speed_value, age)
+
+
+def build_record_loop_state(profile: Profile | None, state: RunState) -> RecordLoopState:
+    modules = build_record_modules(profile, state)
+    speed_key = select_speed_source(modules, state)
+    watch = build_record_watch(profile, state, modules, speed_key)
+    by_key = {(w.module_key, w.command): w for w in watch}
+    next_due = {key: time.monotonic() for key in by_key}
+    discovery_done_initial = sum(m.position for m in modules.values() if m.discoverable)
+    return RecordLoopState(
+        modules=modules,
+        speed_key=speed_key,
+        by_key=by_key,
+        next_due=next_due,
+        discovery_done_initial=discovery_done_initial,
+    )
+
+
+async def _record_ensure_module(link: AdapterLink, loop_state: RecordLoopState, key: str) -> None:
+    if key == loop_state.current_module_key:
+        return
+    module = loop_state.modules[key]
+    for cmd in module.setup:
+        await link.execute(cmd, "record-setup", module.validator, None)
+    loop_state.current_module_key = key
+
+
+def _record_apply_phase(link: AdapterLink, loop_state: RecordLoopState) -> None:
+    new_phase = loop_state.current_phase()
+    if new_phase == loop_state.phase:
+        return
+    if new_phase == "stationary":
+        for module in loop_state.modules.values():
+            if module.discoverable:
+                module.retry_queue = sorted(module.conditional)
+    link.record(
+        Exchange("PHASE", new_phase, new_phase.upper(), datetime.now(UTC).isoformat(), 0.0), "phase"
+    )
+    print(f"[record] phase -> {new_phase}")
+    loop_state.phase = new_phase
+
+
+async def record_loop_tick(
+    link: AdapterLink, state: RunState, state_path: Path, loop_state: RecordLoopState
+) -> None:
+    """One scheduler iteration: poll whatever's due, grouped by module; else,
+    while stationary, run one discovery batch on whichever known module still
+    has work; else sleep until the next due time."""
+    now = time.monotonic()
+    due = sorted(key for key, due_at in loop_state.next_due.items() if due_at <= now)
+    if due:
+        entries = [
+            (key, entry.base_interval, entry.is_speed) for key, entry in loop_state.by_key.items()
+        ]
+        intervals = stretch_watch_intervals(entries)
+        for key in due:
+            entry = loop_state.by_key[key]
+            await _record_ensure_module(link, loop_state, entry.module_key)
+            module = loop_state.modules[entry.module_key]
+            ex = await link.execute(entry.command, entry.stage, module.validator, module.responder)
+            loop_state.latest[entry.command] = LiveValue(ex.response, ex.status, time.monotonic())
+            loop_state.next_due[key] = time.monotonic() + intervals[key]
+            if entry.is_speed:
+                loop_state.speed_value = decode_speed(entry.command, ex, module.responder)
+                loop_state.speed_fetched = time.monotonic()
+        _record_apply_phase(link, loop_state)
+        print(format_live_summary(loop_state.latest))
+    else:
+        _record_apply_phase(link, loop_state)
+        discovering = None
+        if loop_state.phase == "stationary":
+            discovering = next(
+                (m for m in loop_state.modules.values() if m.has_discovery_work()), None
+            )
+        if discovering is not None:
+            await _record_ensure_module(link, loop_state, discovering.key)
+            newly_found = await run_discovery_batch(link, discovering, state, state_path)
+            for did in newly_found:
+                key = (discovering.key, f"22{did:04X}")
+                loop_state.by_key[key] = RecordWatch(
+                    discovering.key, f"22{did:04X}", RECORD_DISCOVERED_WATCH_INTERVAL, "watch"
+                )
+                loop_state.next_due[key] = time.monotonic()
+        else:
+            due_times = loop_state.next_due.values()
+            sleep_for = min(1.0, max(0.0, min(due_times, default=now + 1.0) - now))
+            await asyncio.sleep(sleep_for)
+
+    if time.monotonic() - loop_state.last_status >= RECORD_STATUS_INTERVAL:
+        elapsed = time.monotonic() - loop_state.discovery_start
+        done_now = sum(m.position for m in loop_state.modules.values() if m.discoverable)
+        rate = (done_now - loop_state.discovery_done_initial) / elapsed if elapsed > 0 else 0.0
+        watching = len(loop_state.by_key)
+        line = record_status_line(loop_state.phase, watching, loop_state.modules, rate)
+        print(f"[record] {line}")
+        loop_state.last_status = time.monotonic()
+
+
+async def run_record_loop(
+    link: AdapterLink, state: RunState, profile: Profile | None, state_path: Path
+) -> None:
+    """Runs until cancelled (Ctrl-C): continuously polls every known value and,
+    while the vehicle is stationary, discovers further DIDs on every known ECU
+    in the background. Persists watch/discovery progress as it goes, so both a
+    reconnect within this run and a fresh `record` start later resume exactly
+    where this left off."""
+    loop_state = build_record_loop_state(profile, state)
+    if loop_state.speed_key is None:
+        print("[record] no speed source available; discovery stays paused until one appears")
+    while True:
+        await record_loop_tick(link, state, state_path, loop_state)
+
+
 RECORD_INITIAL_BACKOFF = 5.0
 RECORD_MAX_BACKOFF = 60.0
 
@@ -1819,11 +2324,11 @@ async def record(
     out_dir: Path,
     new: bool,
 ) -> int:
-    """First half of `record`: connects (scanning if no address is given),
-    maintains a resumable run directory, reconnects with backoff through BLE
-    drops, and runs the one-time vehicle inventory (adapter, protocol, mode01,
-    obduds, ecus11). Ends after the inventory - the continuous scheduler that
-    plugs in after it is the next step."""
+    """Connects (scanning if no address is given), maintains a resumable run
+    directory, reconnects with backoff through BLE drops, runs the one-time
+    vehicle inventory (adapter, protocol, mode01, obduds, ecus11), then hands
+    off to `run_record_loop`'s continuous watch/discovery scheduler, which
+    only ends on Ctrl-C (exit 130)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir = None if new else find_resumable_run(out_dir, label)
     if run_dir is None:
@@ -1889,10 +2394,25 @@ async def record(
                         state.save(state_path)
                         failures[stage] = 0
                 else:
-                    state.mark_finished()
-                    state.save(state_path)
                     print_inventory_summary(state)
-                    return 0
+
+                try:
+                    await run_record_loop(link, state, profile, state_path)
+                except asyncio.CancelledError:
+                    link.record(
+                        Exchange(
+                            "SESSION_END", "Ctrl-C", "CANCELLED", datetime.now(UTC).isoformat(), 0.0
+                        ),
+                        "session",
+                    )
+                    for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                        if not link.session.usable:
+                            break
+                        link.record(await link.session.run(cmd), "cleanup")
+                    # finished stays False: the next `record` start resumes
+                    # discovery exactly where this run left off.
+                    state.save(state_path)
+                    return 130
         except ProbeAbortedError as error:
             _log_connection_event(log_path, label, "DISCONNECTED", str(error))
         except Exception as error:
@@ -2041,8 +2561,8 @@ def main(argv: list[str]) -> int:
     s.add_argument("--seconds", type=float, default=8.0)
     r = sub.add_parser(
         "record",
-        help="one start, then autonomous: connect, maintain a resumable run, and run the "
-        "one-time vehicle inventory (the continuous scheduler is a later step)",
+        help="one start, then autonomous: connect, run the one-time vehicle inventory, then "
+        "keep logging every known value and discovering more while stationary, until Ctrl-C",
     )
     r.add_argument("address", nargs="?", help="BLE address; omit to scan for a UART adapter")
     r.add_argument("--profile", help="vehicle profile id (profiles/<id>.toml) or path")

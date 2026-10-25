@@ -1,0 +1,37 @@
+[project]
+name = "didscout"
+version = "0.1.0"
+description = "Read-only OBD-II/UDS discovery over BLE OBD adapters"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bleak>=1.0,<2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "N"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["didscout.py", "test_didscout.py"]
+
+[[tool.mypy.overrides]]
+# bleak ships no py.typed marker.
+module = "bleak"
+ignore_missing_imports = true

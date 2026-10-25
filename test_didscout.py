@@ -550,6 +550,12 @@ def test_probe_stage_e_sends_atsp_on_module_protocol_override(
 
     monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
 
+    class FakeNoteReader:
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(cx, "start_note_reader", lambda _record: FakeNoteReader())
+
     result = asyncio.run(cx.probe("fake", "E", "test", tmp_path, False, profile=profile))
     assert result == 0
     assert sent.index("ATSP6") < sent.index("ATSH710") < sent.index("ATSP7")
@@ -2313,6 +2319,46 @@ def test_share_redacts_identity_connection_and_non_marker_notes(tmp_path: Path) 
     assert marker_entry == {"t": 0.5, "stage": "phase", "status": "MARKER", "response": "charge"}
 
 
+def test_share_drops_response_for_transport_failures(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    entries = [
+        _capture_entry(
+            base,
+            0,
+            "watch",
+            "222A20",
+            "TIMEOUT",
+            "[TimeoutError] AA:BB:CC:DD:EE:FF did not respond",
+            "profile:gateway",
+        ),
+        _capture_entry(
+            base,
+            1,
+            "watch",
+            "222A20",
+            "TRANSPORT_ERROR",
+            "[OSError] connection to AA:BB:CC:DD:EE:FF lost",
+            "profile:gateway",
+        ),
+        _capture_entry(base, 2, "watch", "222A20", "OK", "77A04622A2005", "profile:gateway"),
+    ]
+    _write_capture(run_dir, entries)
+
+    share_path = cx.share(run_dir, vehicle="Test Car")
+    cx.validate_share(share_path)
+
+    with gzip.open(share_path, "rt", encoding="utf-8") as handle:
+        bodies = [json.loads(line) for line in handle][1:]
+
+    timeout_entry = next(e for e in bodies if e["status"] == "TIMEOUT")
+    transport_entry = next(e for e in bodies if e["status"] == "TRANSPORT_ERROR")
+    ok_entry = next(e for e in bodies if e["status"] == "OK")
+    assert "response" not in timeout_entry
+    assert "response" not in transport_entry
+    assert ok_entry["response"] == "77A04622A2005"
+
+
 @pytest.mark.parametrize(
     ("name", "mutate"),
     [
@@ -2328,6 +2374,11 @@ def test_share_redacts_identity_connection_and_non_marker_notes(tmp_path: Path) 
         ),
         ("absolute_timestamp", lambda e: {**e, "response": "2026-10-25T12:00:00+00:00"}),
         ("vin_like_string", lambda e: {**e, "response": "WVWZZZ1KZAW123456"}),
+        ("mac_address_in_response", lambda e: {**e, "response": "seen near AA:BB:CC:DD:EE:FF"}),
+        (
+            "uuid_in_response",
+            lambda e: {**e, "response": "adapter 12345678-1234-5678-1234-567812345678"},
+        ),
     ],
 )
 def test_validate_share_rejects_each_violation(
@@ -2443,13 +2494,21 @@ def test_record_ctrl_c_runs_derive_and_share_on_its_own_run_dir(
     real_derive = cx.derive
     real_share = cx.share
 
-    def tracking_derive(run_dir: Path, **kwargs: object) -> tuple[Path | None, Path]:
+    def tracking_derive(
+        run_dir: Path,
+        *,
+        id_: str | None = None,
+        vehicle: str | None = None,
+        out: Path | None = None,
+    ) -> tuple[Path | None, Path]:
         calls.append(f"derive:{run_dir.name}")
-        return real_derive(run_dir, **kwargs)
+        return real_derive(run_dir, id_=id_, vehicle=vehicle, out=out)
 
-    def tracking_share(run_dir: Path, **kwargs: object) -> Path:
+    def tracking_share(
+        run_dir: Path, *, vehicle: str | None = None, out: Path | None = None
+    ) -> Path:
         calls.append(f"share:{run_dir.name}")
-        return real_share(run_dir, **kwargs)
+        return real_share(run_dir, vehicle=vehicle, out=out)
 
     monkeypatch.setattr(cx, "derive", tracking_derive)
     monkeypatch.setattr(cx, "share", tracking_share)

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import re
 import sys
 import threading
@@ -177,6 +178,50 @@ def check_identify_allowed(command: str) -> str:
     reads in IDENTIFY_DIDS - never the serial number or any VIN DID."""
     cmd = normalize(command)
     if _obduds_transport_allowed(cmd):
+        return cmd
+    if cmd.startswith("22") and cmd[2:] in IDENTIFY_DIDS:
+        return cmd
+    raise ForbiddenCommandError(cmd)
+
+
+def check_mode01_allowed(command: str) -> str:
+    """For `record`'s mode-01 inventory: any `01<two hex digits>` current-data
+    read, on top of the fixed adapter/protocol allow-list - mode 01 is read-only
+    by definition, so no other service can ever match here."""
+    cmd = normalize(command)
+    if cmd in ALLOWED:
+        return cmd
+    if re.fullmatch(r"01[0-9A-F]{2}", cmd):
+        return cmd
+    raise ForbiddenCommandError(cmd)
+
+
+# Broad adapter receive filter/mask that accepts any 11-bit id in 0x700-0x7FF,
+# used only to discover manufacturer ECUs - never contributed to ALLOWED or any
+# other validator, since it has no place outside this one discovery step.
+ECU11_FILTER_COMMANDS = frozenset({"ATCF700", "ATCM700"})
+
+
+def check_ecus11_allowed(command: str) -> str:
+    """For `record`'s 11-bit manufacturer-ECU inventory: adapter setup, the broad
+    0x700-0x7FF receive filter (ECU11_FILTER_COMMANDS), header/response/flow-
+    control setup at any 11-bit header, and the same four identification reads as
+    check_identify_allowed - never the serial number or any VIN DID."""
+    cmd = normalize(command)
+    base = {
+        *ADAPTER_SETUP,
+        "ATSP6",
+        "ATDPN",
+        "ATD",
+        "ATAR",
+        "ATFCSM0",
+        "ATFCSD300000",
+        "ATFCSM1",
+        *ECU11_FILTER_COMMANDS,
+    }
+    if cmd in base:
+        return cmd
+    if re.fullmatch(r"AT(SH|CRA|FCSH)[0-9A-F]{3}", cmd):
         return cmd
     if cmd.startswith("22") and cmd[2:] in IDENTIFY_DIDS:
         return cmd
@@ -574,6 +619,10 @@ class IsotpParse:
     messages: list[tuple[str, bytes]]
     malformed: bool
     incomplete: bool
+    # Headers of frames that opened a multi-frame reply but never completed - a
+    # "first frame" alone still proves an ECU answered, even with no decodable
+    # message (see check_ecus11_allowed's discovery sweep).
+    partial_headers: frozenset[str]
 
 
 def parse_isotp(command: str, response: str) -> IsotpParse:
@@ -628,7 +677,7 @@ def parse_isotp(command: str, response: str) -> IsotpParse:
                 partial[header] = (size, payload, (sequence + 1) % 16)
         else:
             malformed = True
-    return IsotpParse(messages, malformed, bool(partial))
+    return IsotpParse(messages, malformed, bool(partial), frozenset(partial))
 
 
 def _responder_matches(header: str, pattern: str) -> bool:
@@ -1439,6 +1488,421 @@ async def identify(
     return result
 
 
+RECORD_STATE_SCHEMA = 1
+
+
+class RunState:
+    """Typed accessor over `record`'s persisted `state.json` - a plain dict so
+    the file stays ordinary JSON, never pickled."""
+
+    def __init__(self, data: dict[str, object]) -> None:
+        self.data = data
+
+    @classmethod
+    def new(cls, label: str, address: str | None) -> RunState:
+        return cls(
+            {
+                "schema": RECORD_STATE_SCHEMA,
+                "label": label,
+                "created_utc": datetime.now(UTC).isoformat(),
+                "address": address,
+                "finished": False,
+                "stages": {},
+                "results": {},
+            }
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> RunState:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("schema") != RECORD_STATE_SCHEMA:
+            raise ValueError(f"{path}: unsupported state schema {data.get('schema')!r}")
+        return cls(data)
+
+    def save(self, path: Path) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+
+    @property
+    def label(self) -> str:
+        return self.data["label"]  # type: ignore[return-value]
+
+    @property
+    def address(self) -> str | None:
+        return self.data.get("address")  # type: ignore[return-value]
+
+    @address.setter
+    def address(self, value: str | None) -> None:
+        self.data["address"] = value
+
+    @property
+    def finished(self) -> bool:
+        return bool(self.data["finished"])
+
+    def mark_finished(self) -> None:
+        self.data["finished"] = True
+
+    def stage_status(self, stage: str) -> str | None:
+        return self.data["stages"].get(stage)  # type: ignore[union-attr]
+
+    def mark_stage(self, stage: str, status: str) -> None:
+        self.data["stages"][stage] = status  # type: ignore[index]
+
+    def result(self, key: str, default: object = None) -> object:
+        return self.data["results"].get(key, default)  # type: ignore[union-attr]
+
+    def set_result(self, key: str, value: object) -> None:
+        self.data["results"][key] = value  # type: ignore[index]
+
+
+RECORD_RUN_DIR_PATTERN = re.compile(r"record_(\d{8}_\d{6})_(.+)")
+
+
+def find_resumable_run(out_dir: Path, label: str) -> Path | None:
+    """The newest run directory under `out_dir` (by its embedded timestamp) whose
+    `state.json` is unfinished and carries the same label, or None if there is
+    none - what `record` resumes unless `--new` is given."""
+    if not out_dir.is_dir():
+        return None
+    candidates: list[tuple[str, Path]] = []
+    for entry in out_dir.iterdir():
+        match = RECORD_RUN_DIR_PATTERN.fullmatch(entry.name)
+        if not entry.is_dir() or not match:
+            continue
+        state_path = entry / "state.json"
+        if not state_path.is_file():
+            continue
+        try:
+            state = RunState.load(state_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if state.label == label and not state.finished:
+            candidates.append((match.group(1), entry))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
+
+
+async def _scan_uart_devices(seconds: float) -> list[tuple[str, int]]:
+    from bleak import BleakScanner
+
+    devices = await BleakScanner.discover(timeout=seconds, return_adv=True)
+    found = [
+        (device.address, adv.rssi)
+        for device, adv in devices.values()
+        if UART_SERVICE in [u.lower() for u in adv.service_uuids]
+    ]
+    found.sort(key=lambda item: item[1], reverse=True)
+    return found
+
+
+RECORD_SCAN_SECONDS = 8.0
+RECORD_RESCAN_INTERVAL = 10.0
+
+
+async def find_adapter_address(
+    seconds: float = RECORD_SCAN_SECONDS, rescan_interval: float = RECORD_RESCAN_INTERVAL
+) -> str:
+    """Scans for a BLE device advertising the OBD UART service: the sole match if
+    there is one, the strongest RSSI if several, or rescans every
+    `rescan_interval` seconds until one appears - the adapter or vehicle may
+    still be asleep."""
+    while True:
+        found = await _scan_uart_devices(seconds)
+        if len(found) == 1:
+            return found[0][0]
+        if len(found) > 1:
+            address, rssi = found[0]
+            print(f"[record] multiple UART adapters found; using strongest: {address} ({rssi} dBm)")
+            return address
+        print(f"[record] no UART adapter found yet; rescanning every {rescan_interval:.0f}s...")
+        await asyncio.sleep(rescan_interval)
+
+
+async def _inventory_adapter(link: AdapterLink, state: RunState, _profile: Profile | None) -> None:
+    values: dict[str, str] = {}
+    for cmd in ("ATI", "STI", "STDI", "ATRV"):
+        ex = await link.execute(cmd, "adapter")
+        values[cmd] = ex.response
+    state.set_result("adapter", values)
+
+
+# Mode-01 current-data support bitmaps chain 0100 -> 0120 -> ... -> 01A0, each
+# continuing only while the next base PID is flagged supported in the previous
+# bitmap (see SAE J1979).
+MODE01_BITMAP_BASES = ("00", "20", "40", "60", "80", "A0")
+
+
+async def _inventory_protocol(
+    link: AdapterLink, state: RunState, profile: Profile | None
+) -> None:
+    answered: list[str] = []
+    for proto, cmd in (("6", "ATSP6"), ("7", "ATSP7")):
+        await link.execute(cmd, "protocol")
+        ex = await link.execute("0100", "protocol")
+        await link.execute("ATDPN", "protocol")
+        if ex.status == "OK":
+            answered.append(proto)
+    if profile is not None:
+        chosen: str | None = profile.protocol
+    elif "6" in answered:
+        chosen = "6"
+    elif "7" in answered:
+        chosen = "7"
+    else:
+        chosen = None
+    state.set_result("protocol", {"answered": answered, "chosen": chosen})
+
+
+async def _inventory_mode01(link: AdapterLink, state: RunState, _profile: Profile | None) -> None:
+    protocol_result = state.result("protocol")
+    chosen = protocol_result.get("chosen") if isinstance(protocol_result, dict) else None
+    if chosen:
+        await link.execute(FORCE_PROTOCOL[chosen], "mode01", check_mode01_allowed)
+
+    bitmaps: list[str] = []
+    for index, base in enumerate(MODE01_BITMAP_BASES):
+        ex = await link.execute(f"01{base}", "mode01", check_mode01_allowed)
+        if ex.status != "OK":
+            break
+        bitmaps.append(ex.response)
+        if index + 1 >= len(MODE01_BITMAP_BASES):
+            break
+        next_pid = MODE01_BITMAP_BASES[index + 1]
+        if next_pid not in supported_pids([ex.response]):
+            break
+
+    supported = sorted(supported_pids(bitmaps))
+    for pid in supported:
+        await link.execute(f"01{pid}", "mode01", check_mode01_allowed)
+    state.set_result("mode01", {"supported_pids": supported})
+
+
+async def _inventory_obduds(link: AdapterLink, state: RunState, _profile: Profile | None) -> None:
+    async def execute_obduds(command: str, stage: str, responder: str | None = None) -> Exchange:
+        return await link.execute(command, stage, check_obduds_allowed, responder)
+
+    async def execute_identify(command: str, stage: str, responder: str | None = None) -> Exchange:
+        return await link.execute(command, stage, check_identify_allowed, responder)
+
+    responders = await obduds_discover(execute_obduds)
+    results: dict[str, object] = {}
+    for responder in responders:
+        ecu = await obduds_select_responder(execute_obduds, responder, "obduds-setup")
+        data_dids = await obduds_collect_supported_dids(execute_obduds, responder, ecu)
+        if len(data_dids) > OBDUDS_MAX_DATA_DIDS:
+            raise ProbeAbortedError(
+                f"{responder} announced {len(data_dids)} DIDs; limit is {OBDUDS_MAX_DATA_DIDS}"
+            )
+        for did in data_dids:
+            await execute_obduds(f"22{did:04X}", f"obduds-data-{ecu}", responder)
+        identify_values = await read_identify_dids(execute_identify, responder, ecu)
+        results[responder] = {
+            "ecu": ecu,
+            "supported_dids": [f"{did:04X}" for did in data_dids],
+            "identify": identify_values,
+        }
+        await execute_obduds("ATFCSM0", "obduds-cleanup", None)
+    await execute_obduds("ATAR", "obduds-cleanup", None)
+    await execute_obduds("ATD", "obduds-cleanup", None)
+    state.set_result("obduds", results)
+
+
+# 11-bit manufacturer-ECU request ids: 0x700-0x7EF, excluding the legislative
+# functional broadcast 0x7DF (that belongs to mode 01/OBDonUDS, not here).
+ECU11_REQUEST_IDS = [request for request in range(0x700, 0x7F0) if request != 0x7DF]
+
+
+async def _inventory_ecus11(link: AdapterLink, state: RunState, profile: Profile | None) -> None:
+    async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
+        return await link.execute(command, stage, check_ecus11_allowed, responder)
+
+    await execute("ATSP6", "ecus11-setup")
+    await execute("ATDPN", "ecus11-setup")
+    await execute("ATAR", "ecus11-setup")
+    await execute("ATCF700", "ecus11-setup")
+    await execute("ATCM700", "ecus11-setup")
+
+    found: dict[str, str] = {}
+    if profile is not None and profile.protocol == "6":
+        for module in profile.modules:
+            if HEADER_11BIT_PATTERN.fullmatch(module.request) and module.response:
+                found.setdefault(module.request, module.response)
+
+    for request in ECU11_REQUEST_IDS:
+        req_hex = f"{request:03X}"
+        await execute(f"ATSH{req_hex}", "ecus11-discovery")
+        ex = await execute("22F189", "ecus11-discovery")
+        parsed = parse_isotp("22F189", ex.response)
+        seen = {header for header, _payload in parsed.messages} | parsed.partial_headers
+        for header in seen:
+            if header != req_hex:
+                found[req_hex] = header
+    await execute("ATAR", "ecus11-discovery-done")
+
+    ecus: dict[str, object] = {}
+    for request, response in sorted(found.items()):
+        await execute(f"ATSH{request}", "ecus11-identify-setup")
+        await execute(f"ATCRA{response}", "ecus11-identify-setup")
+        await execute(f"ATFCSH{request}", "ecus11-identify-setup")
+        await execute("ATFCSD300000", "ecus11-identify-setup")
+        await execute("ATFCSM1", "ecus11-identify-setup")
+        identify_values = await read_identify_dids(execute, response, request)
+        ecus[request] = {"response": response, "identify": identify_values}
+        await execute("ATFCSM0", "ecus11-identify-setup")
+
+    await execute("ATAR", "ecus11-cleanup")
+    state.set_result("ecus11", ecus)
+
+
+INVENTORY_STAGE_ORDER = ("adapter", "protocol", "mode01", "obduds", "ecus11")
+INVENTORY_STAGE_FUNCS: dict[
+    str, Callable[[AdapterLink, RunState, Profile | None], Awaitable[None]]
+] = {
+    "adapter": _inventory_adapter,
+    "protocol": _inventory_protocol,
+    "mode01": _inventory_mode01,
+    "obduds": _inventory_obduds,
+    "ecus11": _inventory_ecus11,
+}
+
+
+def print_inventory_summary(state: RunState) -> None:
+    protocol = state.result("protocol") or {}
+    mode01 = state.result("mode01") or {}
+    obduds = state.result("obduds") or {}
+    ecus11 = state.result("ecus11") or {}
+    assert isinstance(protocol, dict) and isinstance(mode01, dict)
+    assert isinstance(obduds, dict) and isinstance(ecus11, dict)
+
+    print()
+    print("[record] inventory complete")
+    print(f"  protocol: chosen={protocol.get('chosen')} answered={protocol.get('answered')}")
+    print(f"  mode-01 PIDs: {' '.join(mode01.get('supported_pids', [])) or '-'}")
+    if obduds:
+        for responder, info in obduds.items():
+            assert isinstance(info, dict)
+            print(f"  OBDonUDS {responder}: {len(info.get('supported_dids', []))} DID(s)")
+    else:
+        print("  OBDonUDS: none found")
+    if ecus11:
+        for request, info in ecus11.items():
+            assert isinstance(info, dict)
+            name = info.get("identify", {}).get("F197", "-")
+            print(f"  11-bit ECU {request} -> {info.get('response')}: F197={name}")
+    else:
+        print("  11-bit ECUs: none found")
+
+
+RECORD_INITIAL_BACKOFF = 5.0
+RECORD_MAX_BACKOFF = 60.0
+
+
+def _log_connection_event(log_path: Path, label: str, status: str, detail: str = "") -> None:
+    ex = Exchange("CONNECTION", detail, status, datetime.now(UTC).isoformat(), 0.0)
+    entry = {"stage": "connection", "state": label, "mtu": None, "mode": "record", **ex.__dict__}
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+async def record(
+    address: str | None,
+    profile: Profile | None,
+    label: str,
+    out_dir: Path,
+    new: bool,
+) -> int:
+    """First half of `record`: connects (scanning if no address is given),
+    maintains a resumable run directory, reconnects with backoff through BLE
+    drops, and runs the one-time vehicle inventory (adapter, protocol, mode01,
+    obduds, ecus11). Ends after the inventory - the continuous scheduler that
+    plugs in after it is the next step."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = None if new else find_resumable_run(out_dir, label)
+    if run_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = out_dir / f"record_{stamp}_{label}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        state = RunState.new(label, address)
+    else:
+        print(f"[record] resuming {run_dir}")
+        state = RunState.load(run_dir / "state.json")
+        if address:
+            state.address = address
+
+    state_path = run_dir / "state.json"
+    log_path = run_dir / "capture.jsonl"
+    state.save(state_path)
+
+    failures: dict[str, int] = {}
+    pair_pending = True
+    backoff = RECORD_INITIAL_BACKOFF
+
+    while True:
+        try:
+            resolved = state.address or await find_adapter_address()
+            if resolved != state.address:
+                state.address = resolved
+                state.save(state_path)
+
+            async with connect_adapter(
+                resolved, pair_pending, log_path, label, extra_fields={"mode": "record"}
+            ) as link:
+                if link is None:
+                    return 2
+                pair_pending = False
+                _log_connection_event(log_path, label, "CONNECTED")
+                for cmd in ADAPTER_SETUP:
+                    await link.execute(cmd, "setup")
+
+                for stage in INVENTORY_STAGE_ORDER:
+                    if state.stage_status(stage) in ("done", "failed"):
+                        continue
+                    try:
+                        await INVENTORY_STAGE_FUNCS[stage](link, state, profile)
+                    except ProbeAbortedError as error:
+                        failures[stage] = failures.get(stage, 0) + 1
+                        link.record(
+                            Exchange(
+                                "STAGE_FAILURE",
+                                str(error),
+                                "STAGE_FAILURE",
+                                datetime.now(UTC).isoformat(),
+                                0.0,
+                            ),
+                            stage,
+                        )
+                        if failures[stage] >= 3:
+                            state.mark_stage(stage, "failed")
+                            state.save(state_path)
+                            continue
+                        raise
+                    else:
+                        state.mark_stage(stage, "done")
+                        state.save(state_path)
+                        failures[stage] = 0
+                else:
+                    state.mark_finished()
+                    state.save(state_path)
+                    print_inventory_summary(state)
+                    return 0
+        except ProbeAbortedError as error:
+            _log_connection_event(log_path, label, "DISCONNECTED", str(error))
+        except Exception as error:
+            # Anything else here is a connection/transport failure (BLE connect
+            # timeout, OS-level disconnect, ...) - reconnect rather than crash.
+            _log_connection_event(log_path, label, "DISCONNECTED", str(error))
+
+        _log_connection_event(log_path, label, "RECONNECTING")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2.0, RECORD_MAX_BACKOFF)
+        if address is None:
+            state.address = None
+
+
 async def run_session(
     address: str,
     label: str,
@@ -1571,6 +2035,18 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="mode", required=True)
     s = sub.add_parser("scan", help="list nearby BLE devices")
     s.add_argument("--seconds", type=float, default=8.0)
+    r = sub.add_parser(
+        "record",
+        help="one start, then autonomous: connect, maintain a resumable run, and run the "
+        "one-time vehicle inventory (the continuous scheduler is a later step)",
+    )
+    r.add_argument("address", nargs="?", help="BLE address; omit to scan for a UART adapter")
+    r.add_argument("--profile", help="vehicle profile id (profiles/<id>.toml) or path")
+    r.add_argument("--label", default="vehicle", help="run label (default: vehicle)")
+    r.add_argument("--out", type=Path, default=Path(__file__).parent / "logs")
+    r.add_argument(
+        "--new", action="store_true", help="start a fresh run instead of resuming an unfinished one"
+    )
     p = sub.add_parser("probe", help="run allow-listed stages against the adapter")
     p.add_argument("address", help="BLE address from `scan`")
     p.add_argument(
@@ -1706,6 +2182,15 @@ def main(argv: list[str]) -> int:
     if args.mode == "scan":
         asyncio.run(scan(args.seconds))
         return 0
+    if args.mode == "record":
+        profile = None
+        if args.profile:
+            try:
+                profile = resolve_profile(args.profile)
+            except ProfileError as error:
+                parser.error(str(error))
+        record_label = re.sub(r"[^a-z0-9_-]", "", args.label.lower()) or "vehicle"
+        return asyncio.run(record(args.address, profile, record_label, args.out, args.new))
     label = re.sub(r"[^a-z0-9_-]", "", args.state.lower()) or "unlabeled"
     if args.mode == "obduds":
         return asyncio.run(

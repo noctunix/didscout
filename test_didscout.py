@@ -351,6 +351,44 @@ def test_profile_allows_survey_did_without_name(tmp_path: Path) -> None:
     assert profile.modules[0].dids[0].poll == "survey"
 
 
+def test_profile_allows_unnamed_unverified_did(tmp_path: Path) -> None:
+    text = VALID_PROFILE_TOML.replace('name = "test did"\n', "").replace(
+        'status = "plausible"', 'status = "unverified"'
+    )
+    profile = _load(tmp_path, text)
+    assert profile.modules[0].dids[0].name is None
+    assert profile.modules[0].dids[0].status == "unverified"
+
+
+def test_profile_rejects_unnamed_plausible_did(tmp_path: Path) -> None:
+    text = VALID_PROFILE_TOML.replace('name = "test did"\n', "")
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, text)
+
+
+def test_module_protocol_override_allows_29bit_header_on_protocol_6_profile(
+    tmp_path: Path,
+) -> None:
+    text = VALID_PROFILE_TOML.replace('request = "710"', 'request = "18DA10F1"\nprotocol = "7"')
+    profile = _load(tmp_path, text)
+    assert profile.protocol == "6"
+    assert profile.modules[0].protocol == "7"
+    assert cx.module_effective_protocol(profile.modules[0], profile.protocol) == "7"
+
+
+def test_module_protocol_override_must_be_known_protocol(tmp_path: Path) -> None:
+    text = VALID_PROFILE_TOML.replace('request = "710"', 'request = "710"\nprotocol = "9"')
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, text)
+
+
+def test_module_without_protocol_override_uses_profile_protocol() -> None:
+    profile = cx.resolve_profile("vag-ppe")
+    module = profile.modules[0]
+    assert module.protocol is None
+    assert cx.module_effective_protocol(module, profile.protocol) == profile.protocol
+
+
 def test_profile_id_must_equal_file_stem(tmp_path: Path) -> None:
     with pytest.raises(cx.ProfileError):
         _load(tmp_path, VALID_PROFILE_TOML, filename="other.toml")
@@ -454,6 +492,66 @@ def test_watch_loop_resets_up_only_on_module_change(monkeypatch: pytest.MonkeyPa
 def test_probe_stage_e_without_profile_is_a_parser_error() -> None:
     with pytest.raises(SystemExit):
         cx.main(["probe", "fake", "--state", "x", "--stages", "E"])
+
+
+def test_probe_stage_e_sends_atsp_on_module_protocol_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile_path = tmp_path / "mixed.toml"
+    profile_path.write_text(
+        """
+        schema = 1
+        id = "mixed"
+        name = "Mixed protocol profile"
+        description = "Test fixture"
+        protocol = "6"
+        vehicles = ["Test vehicle"]
+
+        [[sources]]
+        title = "Test"
+        url = "https://example.com"
+        license = "own discovery"
+
+        [[modules]]
+        id = "gateway"
+        request = "710"
+        response = "77A"
+
+        [[modules.dids]]
+        did = "2AB6"
+        name = "range remaining"
+        status = "validated"
+        poll = "once"
+
+        [[modules]]
+        id = "obdonuds-ecu"
+        request = "18DA10F1"
+        response = "18DAF110"
+        protocol = "7"
+
+        [[modules.dids]]
+        did = "F400"
+        name = "support bitmap"
+        status = "unverified"
+        poll = "once"
+        """
+    )
+    profile = cx.load_profile(profile_path)
+
+    sent: list[str] = []
+
+    def responder(cmd: str) -> bytes:
+        sent.append(cmd)
+        if cmd == "ATZ":
+            return b"ELM327 v1.4\r>"
+        return b"OK\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    result = asyncio.run(cx.probe("fake", "E", "test", tmp_path, False, profile=profile))
+    assert result == 0
+    assert sent.index("ATSP6") < sent.index("ATSH710") < sent.index("ATSP7")
+    assert sent.index("ATSP7") < sent.index("ATSH18DA10F1")
 
 
 def test_sweep_header_argument_derives_protocol_and_rax(
@@ -928,7 +1026,9 @@ def test_adapter_link_execute_logs_and_passes_through_noncritical_status() -> No
 
         session = cx.ElmSession(write, 20)
         logged: list[tuple[str, str]] = []
-        link = cx.AdapterLink(session, lambda ex, stage: logged.append((ex.command, stage)))
+        link = cx.AdapterLink(
+            session, lambda ex, stage, module=None: logged.append((ex.command, stage))
+        )
 
         # ATI is in the default non-critical set, so a reply that doesn't classify
         # as OK must not abort - but it's still recorded.
@@ -945,7 +1045,7 @@ def test_adapter_link_execute_fails_closed_on_critical_at_not_ok() -> None:
             session.on_notify(b"?\r>")
 
         session = cx.ElmSession(write, 20)
-        link = cx.AdapterLink(session, lambda ex, stage: None)
+        link = cx.AdapterLink(session, lambda ex, stage, module=None: None)
 
         with pytest.raises(cx.ProbeAbortedError):
             await link.execute("ATE0", "setup")
@@ -959,7 +1059,7 @@ def test_adapter_link_execute_fails_closed_on_unusable_session() -> None:
             raise OSError("synthetic disconnect")
 
         session = cx.ElmSession(write, 20)
-        link = cx.AdapterLink(session, lambda ex, stage: None)
+        link = cx.AdapterLink(session, lambda ex, stage, module=None: None)
 
         # ATRV is non-critical, but a session that lost synchronization must still
         # fail closed rather than let the caller send a next command.
@@ -1870,6 +1970,12 @@ def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_
 
     asyncio.run(scenario())
     assert state.finished is False
+
+    entries = [json.loads(line) for line in (tmp_path / "capture.jsonl").read_text().splitlines()]
+    discover_entries = [e for e in entries if e["stage"].startswith("discover-")]
+    watch_entries = [e for e in entries if e["stage"] == "watch"]
+    assert discover_entries and all(e["module"] == "ecus11:710" for e in discover_entries)
+    assert watch_entries and all(e["module"] == "ecus11:710" for e in watch_entries)
 
 
 def test_mode01_protocol_is_whichever_answered_mode01_not_the_profile(

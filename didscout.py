@@ -292,6 +292,10 @@ class Module:
     request: str
     dids: list[ModuleDid]
     response: str | None = None
+    # Overrides the profile's protocol for this module only; None means "use the
+    # profile's". A 29-bit request header requires the effective protocol - this
+    # override or the profile's - to be "7".
+    protocol: str | None = None
     discover: list[tuple[str, str]] | None = None
 
 
@@ -421,8 +425,10 @@ def _load_dids(raw: object, path: Path, context: str) -> list[ModuleDid]:
         name = entry.get("name")
         if name is not None and (not isinstance(name, str) or not name):
             raise ProfileError(path, f"{sub}.name", "must be a non-empty string if present")
-        if poll != "survey" and name is None:
-            raise ProfileError(path, f"{sub}.name", 'required unless poll is "survey"')
+        if status != "unverified" and poll != "survey" and name is None:
+            raise ProfileError(
+                path, f"{sub}.name", 'required unless status is "unverified" or poll is "survey"'
+            )
 
         interval_raw = entry.get("interval")
         interval: float | None
@@ -458,7 +464,7 @@ def _load_modules(raw: object, protocol: str, path: Path) -> list[Module]:
             raise ProfileError(path, context, "must be a table")
         _check_keys(
             entry,
-            {"id", "request", "response", "discover", "dids"},
+            {"id", "request", "response", "protocol", "discover", "dids"},
             {"id", "request", "dids"},
             path,
             context,
@@ -469,11 +475,20 @@ def _load_modules(raw: object, protocol: str, path: Path) -> list[Module]:
             raise ProfileError(path, f"{context}.id", f"duplicate module id {module_id!r}")
         seen_ids.add(module_id)
 
+        module_protocol = entry.get("protocol")
+        if module_protocol is not None and module_protocol not in FORCE_PROTOCOL:
+            raise ProfileError(
+                path, f"{context}.protocol", f"must be one of {sorted(FORCE_PROTOCOL)}"
+            )
+        effective_protocol = module_protocol or protocol
+
         request = _expect_str(entry, "request", path, context)
         if HEADER_29BIT_REQUEST_PATTERN.fullmatch(request):
-            if protocol != "7":
+            if effective_protocol != "7":
                 raise ProfileError(
-                    path, f"{context}.request", '29-bit header requires profile protocol "7"'
+                    path,
+                    f"{context}.request",
+                    "29-bit header requires the module's effective protocol to be \"7\"",
                 )
         elif HEADER_11BIT_PATTERN.fullmatch(request):
             if int(request, 16) > 0x7FF:
@@ -497,9 +512,22 @@ def _load_modules(raw: object, protocol: str, path: Path) -> list[Module]:
         dids = _load_dids(entry.get("dids"), path, context)
 
         modules.append(
-            Module(id=module_id, request=request, response=response, discover=discover, dids=dids)
+            Module(
+                id=module_id,
+                request=request,
+                response=response,
+                protocol=module_protocol,
+                discover=discover,
+                dids=dids,
+            )
         )
     return modules
+
+
+def module_effective_protocol(module: Module, profile_protocol: str) -> str:
+    """The CAN protocol `module` actually talks: its own override if set, else
+    the profile's."""
+    return module.protocol or profile_protocol
 
 
 def load_profile(path: Path) -> Profile:
@@ -1016,7 +1044,7 @@ class AdapterLink:
     traffic and JSONL logging. Yielded by `connect_adapter`."""
 
     session: ElmSession
-    record: Callable[[Exchange, str], None]
+    record: Callable[[Exchange, str, str | None], None]
     non_critical_at: frozenset[str] = DEFAULT_NON_CRITICAL_AT
 
     async def execute(
@@ -1025,11 +1053,14 @@ class AdapterLink:
         stage: str,
         validator: Callable[[str], str] = check_allowed,
         responder: str | None = None,
+        module: str | None = None,
     ) -> Exchange:
         """Runs and logs `command`; fails closed by raising ProbeAbortedError if the
-        session became unusable or a critical AT command did not come back OK."""
+        session became unusable or a critical AT command did not come back OK.
+        `module` is only given for `record`'s watch/discovery reads, so the log
+        alone says which known ECU a given exchange belongs to."""
         ex = await self.session.run(command, validator, responder)
-        self.record(ex, stage)
+        self.record(ex, stage, module)
         critical = command.startswith("AT") and command not in self.non_critical_at
         if not self.session.usable or (critical and ex.status != "OK"):
             raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
@@ -1065,12 +1096,13 @@ async def connect_adapter(
 
         with log_path.open("a", encoding="utf-8") as log:
 
-            def record(ex: Exchange, stage: str) -> None:
+            def record(ex: Exchange, stage: str, module: str | None = None) -> None:
                 entry = {
                     "stage": stage,
                     "state": label,
                     "mtu": client.mtu_size,
                     **ex.__dict__,
+                    **({"module": module} if module is not None else {}),
                     **(extra_fields or {}),
                 }
                 log.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1166,7 +1198,12 @@ async def _probe(
         for stage in stages:
             if stage == "E":
                 assert profile is not None  # enforced by argument parsing in main()
+                current_protocol: str | None = None
                 for module in profile.modules:
+                    effective = module_effective_protocol(module, profile.protocol)
+                    if effective != current_protocol:
+                        await execute(FORCE_PROTOCOL[effective], stage, check_sweep_allowed)
+                        current_protocol = effective
                     for cmd in module_setup_commands(module):
                         await execute(cmd, stage, check_sweep_allowed)
                     for did in module.dids:
@@ -2002,7 +2039,7 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             key = f"profile:{pm.id}"
             modules[key] = RecordModule(
                 key=key,
-                protocol=profile.protocol,
+                protocol=module_effective_protocol(pm, profile.protocol),
                 setup=module_setup_commands(pm),
                 validator=check_sweep_allowed,
                 responder=pm.response,
@@ -2150,7 +2187,9 @@ async def run_discovery_batch(
     stage = f"discover-{module.key}"
     newly_found: list[int] = []
     for did in batch:
-        ex = await link.execute(f"22{did:04X}", stage, module.validator, module.responder)
+        ex = await link.execute(
+            f"22{did:04X}", stage, module.validator, module.responder, module=module.key
+        )
         if ex.status == "OK":
             module.discovered.add(did)
             module.conditional.discard(did)
@@ -2274,7 +2313,13 @@ async def record_loop_tick(
             entry = loop_state.by_key[key]
             await _record_ensure_module(link, loop_state, entry.module_key)
             module = loop_state.modules[entry.module_key]
-            ex = await link.execute(entry.command, entry.stage, module.validator, module.responder)
+            ex = await link.execute(
+                entry.command,
+                entry.stage,
+                module.validator,
+                module.responder,
+                module=entry.module_key,
+            )
             loop_state.latest[entry.command] = LiveValue(ex.response, ex.status, time.monotonic())
             loop_state.next_due[key] = time.monotonic() + intervals[key]
             if entry.is_speed:
@@ -2508,7 +2553,12 @@ async def run_session(
                 await execute(cmd, "C")
 
         if profile is not None:
+            current_protocol: str | None = None
             for module in profile.modules:
+                effective = module_effective_protocol(module, profile.protocol)
+                if effective != current_protocol:
+                    await execute(FORCE_PROTOCOL[effective], "E", check_sweep_allowed)
+                    current_protocol = effective
                 for cmd in module_setup_commands(module):
                     await execute(cmd, "E", check_sweep_allowed)
                 for did in module.dids:

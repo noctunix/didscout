@@ -76,8 +76,9 @@ def test_sweep_allows_any_header_read_did() -> None:
 
 
 def test_sweep_still_rejects_vin_and_other_services() -> None:
-    with pytest.raises(cx.ForbiddenCommandError):
-        cx.check_sweep_allowed("22F190")
+    for vin in ("22F190", "22F802"):
+        with pytest.raises(cx.ForbiddenCommandError):
+            cx.check_sweep_allowed(vin)
     for cmd in ("2E2AB8", "27FFFF", "10FFFF", "31FFFF"):
         with pytest.raises(cx.ForbiddenCommandError):
             cx.check_sweep_allowed(cmd)

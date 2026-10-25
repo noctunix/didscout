@@ -148,7 +148,8 @@ def check_allowed(command: str) -> str:
     return cmd
 
 
-VIN_DID = "F190"
+# Classic UDS VIN and the SAE J1979-2 OBDonUDS VIN.
+VIN_DIDS = frozenset({"F190", "F802"})
 
 
 def check_sweep_allowed(command: str) -> str:
@@ -159,7 +160,7 @@ def check_sweep_allowed(command: str) -> str:
     if cmd in ALLOWED:
         return cmd
     if re.fullmatch(r"22[0-9A-F]{4}", cmd):
-        if cmd[2:] == VIN_DID:
+        if cmd[2:] in VIN_DIDS:
             raise ForbiddenCommandError(cmd)
         return cmd
     if re.fullmatch(r"AT(SH|CRA|FCSH)[0-9A-F]{3}", cmd):
@@ -664,7 +665,7 @@ async def sweep_range(
     hits: list[tuple[str, str]] = []
     for did in range(start_i, end_i + 1):
         cmd = f"22{did:04X}"
-        if cmd[2:] == VIN_DID:
+        if cmd[2:] in VIN_DIDS:
             print(f"[{stage}] {cmd} skipped (VIN, never read)")
             continue
         ex = await session.run(cmd, check_sweep_allowed, responder)

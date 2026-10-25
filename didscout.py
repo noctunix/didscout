@@ -977,6 +977,7 @@ async def connect_adapter(
     log_path: Path,
     label: str,
     non_critical_at: frozenset[str] = DEFAULT_NON_CRITICAL_AT,
+    extra_fields: dict[str, object] | None = None,
 ) -> AsyncIterator[AdapterLink | None]:
     """Connects to the BLE UART adapter and yields an AdapterLink shared by every
     mode - or None if the adapter has no UART write characteristic (wrong device),
@@ -984,8 +985,6 @@ async def connect_adapter(
     from bleak import BleakClient
 
     async with BleakClient(address, timeout=20.0) as client:
-        if pair:
-            await client.pair()
         chunk = max(20, client.mtu_size - 3)
         write_char = client.services.get_characteristic(UART_WRITE)
         if write_char is None:
@@ -1001,12 +1000,31 @@ async def connect_adapter(
         with log_path.open("a", encoding="utf-8") as log:
 
             def record(ex: Exchange, stage: str) -> None:
-                entry = {"stage": stage, "state": label, "mtu": client.mtu_size, **ex.__dict__}
+                entry = {
+                    "stage": stage,
+                    "state": label,
+                    "mtu": client.mtu_size,
+                    **ex.__dict__,
+                    **(extra_fields or {}),
+                }
                 log.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 log.flush()
                 first = ex.response.splitlines()[0] if ex.response else ""
                 status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
                 print(f"{status}  {first[:60]}")
+
+            if pair:
+                # The adapter may already be bonded from a previous run - pair()
+                # raising then is expected, not a reason to abort the connection.
+                try:
+                    await client.pair()
+                except Exception as error:
+                    record(
+                        Exchange(
+                            "PAIR", str(error), "PAIR_FAILED", datetime.now(UTC).isoformat(), 0.0
+                        ),
+                        "connection",
+                    )
 
             yield AdapterLink(session, record, non_critical_at)
         await client.stop_notify(UART_NOTIFY)
@@ -1156,6 +1174,52 @@ async def obduds_discover(
     return obduds_responders(protocol.response)
 
 
+async def obduds_collect_supported_dids(
+    execute: Callable[[str, str, str | None], Awaitable[Exchange]],
+    responder: str,
+    ecu: str,
+) -> list[int]:
+    """Walks one responder's F400/F420/... support bitmaps, following chained
+    continuation bits, and returns the announced current-data DIDs (F4xx/F5xx).
+    Shared by `obduds_probe` and `record`'s `obduds` inventory stage."""
+    supported: set[int] = set()
+    base = OBDUDS_FIRST_SUPPORT_DID
+    while base <= OBDUDS_LAST_SUPPORT_DID:
+        command = f"22{base:04X}"
+        ex = await execute(command, f"obduds-support-{ecu}", responder)
+        if ex.status != "OK":
+            break
+        announced = obduds_supported_dids(command, ex.response, responder)
+        supported.update(announced)
+        next_base = base + 0x20
+        if next_base not in announced:
+            break
+        base = next_base
+    return sorted(did for did in supported if did & 0x1F)
+
+
+async def read_identify_dids(
+    execute: Callable[[str, str, str | None], Awaitable[Exchange]],
+    responder: str,
+    ecu: str,
+) -> dict[str, str]:
+    """Reads the four ECU identification DIDs (never the serial number or any
+    VIN) for one responder; F197 is decoded as ascii, everything else reported
+    as its exchange status. Shared by `identify` and `record`'s inventory
+    stages."""
+    values: dict[str, str] = {}
+    for did in sorted(IDENTIFY_DIDS):
+        command = f"22{did}"
+        ex = await execute(command, f"identify-{ecu}", responder)
+        if did == "F197" and ex.status == "OK":
+            payload = decode_positive_payload(command, ex.response, responder)
+            value = payload.decode("ascii", errors="replace") if payload else ex.status
+        else:
+            value = ex.status
+        values[did] = value
+    return values
+
+
 async def obduds_select_responder(
     execute: Callable[[str, str, str | None], Awaitable[Exchange]],
     responder: str,
@@ -1303,21 +1367,7 @@ async def obduds_probe(
             for responder in responders:
                 ecu = await obduds_select_responder(execute, responder, "obduds-setup")
 
-                supported: set[int] = set()
-                base = OBDUDS_FIRST_SUPPORT_DID
-                while base <= OBDUDS_LAST_SUPPORT_DID:
-                    command = f"22{base:04X}"
-                    ex = await execute(command, f"obduds-support-{ecu}", responder)
-                    if ex.status != "OK":
-                        break
-                    announced = obduds_supported_dids(command, ex.response, responder)
-                    supported.update(announced)
-                    next_base = base + 0x20
-                    if next_base not in announced:
-                        break
-                    base = next_base
-
-                data_dids = sorted(did for did in supported if did & 0x1F)
+                data_dids = await obduds_collect_supported_dids(execute, responder, ecu)
                 print(
                     f"[obduds {responder}] supported data DIDs: "
                     f"{' '.join(f'{did:04X}' for did in data_dids) or '-'}"
@@ -1374,16 +1424,8 @@ async def identify(
 
             for responder in responders:
                 ecu = await obduds_select_responder(execute, responder, "identify-setup")
-                summary: list[str] = []
-                for did in sorted(IDENTIFY_DIDS):
-                    command = f"22{did}"
-                    ex = await execute(command, f"identify-{ecu}", responder)
-                    if did == "F197" and ex.status == "OK":
-                        payload = decode_positive_payload(command, ex.response, responder)
-                        value = payload.decode("ascii", errors="replace") if payload else ex.status
-                    else:
-                        value = ex.status
-                    summary.append(f"{did}={value}")
+                values = await read_identify_dids(execute, responder, ecu)
+                summary = [f"{did}={value}" for did, value in values.items()]
                 print(f"[identify {responder}] " + " ".join(summary))
         except ProbeAbortedError as error:
             print(f"identify aborted: {error}", file=sys.stderr)

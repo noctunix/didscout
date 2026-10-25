@@ -6,7 +6,7 @@ automatically on Ctrl-C), never a raw log.
 
 A capture PR is: run `record`, attach the resulting `.share.jsonl.gz` here,
 nothing else - no raw `capture.jsonl`, no `state.json`, no screenshots of the
-display. `validate_share` (see `AGENTS.md`) checks every file here against the
+display. `validate_share` (see `CONTRIBUTING.md`) checks every file here against the
 redaction rules on every test run, so a file that still carries an identity
 payload, a non-marker note, an absolute timestamp, or anything VIN-like fails
 the test suite automatically.

@@ -83,7 +83,7 @@ uv run python didscout.py derive logs/record_20260101_120000_vehicle --vehicle "
 a PR: connection events, adapter identity, and free-text notes are dropped;
 only `F197` keeps its decoded content among the identification DIDs; a typed
 note survives only as a canonical phase marker (`idle`/`drive`/`charge`/`park`,
-German included). See `AGENTS.md` for the exact rules `validate_share` enforces.
+German included). `CONTRIBUTING.md` lists the exact rules `validate_share` enforces.
 
 ```
 uv run python didscout.py share logs/record_20260101_120000_vehicle --vehicle "my car"

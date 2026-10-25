@@ -88,7 +88,7 @@ citation either.
 
 ## Before opening the PR
 
-Run the checks from `AGENTS.md`:
+Run the checks:
 
 ```
 uv run pytest
@@ -102,3 +102,34 @@ uv run mypy
 suite automatically - fix what it reports before opening the PR. The same goes
 for a capture PR: every file in `captures/` is checked against `validate_share`
 on each run.
+
+## Code changes
+
+Pull requests that touch `didscout.py` must keep these invariants; they are what
+makes the tool safe to point at a vehicle:
+
+- Every outgoing command passes an allow-list validator before it is sent. No
+  code path may send a command that bypasses validation.
+- Only read services ever leave the allow-lists: mode 01, UDS
+  ReadDataByIdentifier (`0x22`) and passive `ATMA` monitoring. No write,
+  clear-DTC, routine-control, security-access, session-control or reset service
+  may become reachable, regardless of range or header arguments.
+- VIN DIDs (`F190`, `F802`) and the ECU serial number (`F18C`) are never read.
+- A timeout or transport error marks the session unusable; no further requests
+  are sent on it.
+- `derive` and `share` never talk to the adapter.
+
+Tests use synthetic fixtures only - never real vehicle responses. Identifiers,
+comments and messages are English; comments explain a non-obvious why, a
+protocol quirk or point at an external spec.
+
+## What `share` removes
+
+`share` drops connection events, adapter identity (`ATI`, `STI`, `STDI`) and
+free-text notes (a note survives only as a canonical phase marker), the
+responses of `F187`/`F189`/`F191` (only `F197`, the system name, stays) and the
+response text of `TIMEOUT`/`TRANSPORT_ERROR` exchanges, which can embed the
+adapter's BLE address. Times become seconds since the start of the run.
+`validate_share` rejects unknown keys, absolute timestamps, non-marker notes,
+identification payloads and any VIN-, MAC- or UUID-looking string; the test
+suite runs it on every file in `captures/`.

@@ -2920,8 +2920,7 @@ UUID_PATTERN = re.compile(
 
 def _redact_entry(entry: dict[str, object], origin: datetime | None) -> dict[str, object] | None:
     """One capture entry, redacted for `share`, or None if it must be dropped
-    entirely - see `AGENTS.md`/`CONTRIBUTING.md` for what a shared capture may
-    and may never contain."""
+    entirely."""
     command = str(entry.get("command", ""))
     stage = str(entry.get("stage", ""))
     if stage == "connection" or command in ADAPTER_IDENTITY_COMMANDS:

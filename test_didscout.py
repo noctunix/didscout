@@ -317,13 +317,16 @@ def test_profile_rejections(tmp_path: Path, name: str, broken: str) -> None:
 
 
 def test_profile_rejects_duplicate_did_in_one_module(tmp_path: Path) -> None:
-    broken = VALID_PROFILE_TOML + """
+    broken = (
+        VALID_PROFILE_TOML
+        + """
     [[modules.dids]]
     did = "2AB8"
     name = "dup"
     status = "plausible"
     poll = "once"
     """
+    )
     with pytest.raises(cx.ProfileError):
         _load(tmp_path, broken)
 
@@ -403,11 +406,15 @@ def test_build_watch_schedule_includes_watch_always_and_survey_when_enabled() ->
 
 def test_watch_loop_resets_up_only_on_module_change(monkeypatch: pytest.MonkeyPatch) -> None:
     module_a = cx.Module(
-        id="a", request="710", response="77A",
+        id="a",
+        request="710",
+        response="77A",
         dids=[cx.ModuleDid(did="2AB8", status="plausible", poll="watch", interval=5.0)],
     )
     module_b = cx.Module(
-        id="b", request="70B", response="775",
+        id="b",
+        request="70B",
+        response="775",
         dids=[cx.ModuleDid(did="18A0", status="plausible", poll="watch", interval=5.0)],
     )
     schedule = cx.build_watch_schedule([module_a, module_b], survey=False, survey_interval=0.0)
@@ -1108,7 +1115,7 @@ def test_reply_fragmented_across_notifications() -> None:
             asyncio.ensure_future(reply())
 
         session = cx.ElmSession(write, 20)
-        return await session.run("222AB8")
+        return await session.run("222AB8", cx.check_sweep_allowed, "77A")
 
     ex = asyncio.run(scenario())
     assert ex.status == "OK"
@@ -1290,7 +1297,8 @@ def test_probe_logs_failure_and_disconnects_without_next_command(
     # 100 ms made this transport test scheduler-dependent under a full suite.
     monkeypatch.setattr(cx, "DEFAULT_TIMEOUT", 0.5)
     monkeypatch.setitem(cx.SLOW_COMMANDS, "ATZ", 0.5)
-    result = asyncio.run(cx.probe("fake", "BE", "synthetic", tmp_path, False))
+    profile = cx.resolve_profile("vag-ppe")
+    result = asyncio.run(cx.probe("fake", "BE", "synthetic", tmp_path, False, profile=profile))
     assert result == 2
     assert disconnected == [True]
     assert sent[-1] == target

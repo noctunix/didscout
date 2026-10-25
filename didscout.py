@@ -296,9 +296,7 @@ def _load_sources(raw: object, path: Path) -> list[ProfileSource]:
     return sources
 
 
-def _load_discover(
-    raw: object, path: Path, context: str
-) -> list[tuple[str, str]] | None:
+def _load_discover(raw: object, path: Path, context: str) -> list[tuple[str, str]] | None:
     if raw is None:
         return None
     if not isinstance(raw, list) or not raw:
@@ -460,7 +458,14 @@ def load_profile(path: Path) -> Profile:
     _scan_for_vin_like(raw, path, "<root>")
 
     root_keys = {
-        "schema", "id", "name", "description", "protocol", "vehicles", "sources", "modules"
+        "schema",
+        "id",
+        "name",
+        "description",
+        "protocol",
+        "vehicles",
+        "sources",
+        "modules",
     }
     _check_keys(raw, root_keys, root_keys, path, "<root>")
 
@@ -1421,7 +1426,9 @@ async def run_session(
         record = link.record
 
         async def execute(
-            command: str, stage: str, validator: Callable[[str], str] = check_allowed,
+            command: str,
+            stage: str,
+            validator: Callable[[str], str] = check_allowed,
             responder: str | None = None,
         ) -> Exchange:
             ex = await session.run(command, validator, responder)

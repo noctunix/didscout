@@ -31,9 +31,20 @@ here.
 ## File naming and schema
 
 One file per platform: `profiles/<make>-<platform>.toml`, e.g. `vag-ppe.toml`. The
-file stem must equal the profile's `id` field. See `profiles/vag-ppe.toml` for a
-complete example; the schema itself is documented in `AGENTS.md` and enforced by
-`load_profile` in `didscout.py`.
+file stem must equal the profile's `id` field. `profiles/vag-ppe.toml` is a
+complete example; `load_profile` in `didscout.py` enforces the schema and rejects
+any key not listed here:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `schema` | yes | always `1` |
+| `id` | yes | `[a-z0-9-]+`, equal to the file stem |
+| `name`, `description` | yes | free text |
+| `protocol` | yes | `"6"` (ISO 15765-4, 11-bit, 500k) or `"7"` (29-bit, 500k) |
+| `vehicles` | yes | list of free-text vehicle names, at least one; mark what you tested |
+| `[[sources]]` | at least one | `title`, `url`, `license` |
+| `[[modules]]` | yes | `id` (unique), `request` (11-bit up to `7FF`, or `18DAxxF1` with protocol `"7"`), optional `response` (`77A`-style or `18DAF1xx`; omit if unknown, then only single-frame replies work), optional `discover` (list of `["start", "end"]` DID ranges) |
+| `[[modules.dids]]` | yes | `did` (4 hex, unique per module), `name` (optional only for `survey`), `status`, `poll`, `interval` (seconds, >= 5, required for `watch`/`survey`, not allowed for `once`) |
 
 Each DID's `status` says how much to trust it:
 

@@ -1,9 +1,23 @@
-# Contributing a vehicle profile
+# Contributing
+
+Two ways to contribute what `record` found on your vehicle:
+
+- **A profile PR** (this file): review `didscout derive`'s draft against the
+  display, confirm/correct values, and open a PR with the resulting
+  `profiles/<make>-<platform>.toml`. See below for the schema.
+- **A capture PR**: run `record`, attach the `share` output - a redacted
+  `<name>.share.jsonl.gz` - under `captures/` via a PR, nothing else. No raw
+  log, no `state.json`, no screenshots. Maintainers derive profile drafts from
+  contributed captures the same way.
+
+## What's a profile
 
 A vehicle profile (`profiles/<id>.toml`) is a candidate header/DID list for one
-platform - the data `probe --profile`/`session --profile` need to read gateway,
-tyre, or other module DIDs on top of the legislative mode-01/OBDonUDS traffic this
-tool already does safely on any vehicle.
+platform - the data `probe --profile`/`session --profile`/`record` need to read
+gateway, tyre, or other module DIDs on top of the legislative mode-01/OBDonUDS
+traffic this tool already does safely on any vehicle. `didscout derive` writes
+one (`profile-draft.toml`) from a `record` run as a starting point - review every
+DID against the display before it becomes a real PR.
 
 ## What a profile can and cannot contain
 
@@ -18,7 +32,8 @@ A profile, and your PR, must **never** contain:
 
 - a VIN, or anything that looks like one (the loader rejects any 17-character
   string matching the ISO 3779 shape, anywhere in the file)
-- raw adapter responses, logs, or `*.jsonl` files
+- raw adapter responses, logs, `*.jsonl`/`*.jsonl.gz` files, or `state.json`
+  (a capture PR attaches only `share`'s redacted output, see above)
 - measured/decoded values (state of charge, range, temperature, ...)
 - an odometer reading
 - a BLE MAC address
@@ -84,4 +99,6 @@ uv run mypy
 
 `pytest` loads every file in `profiles/` and validates it the same way
 `load_profile` would at runtime, so a broken or unsafe profile fails the test
-suite automatically - fix what it reports before opening the PR.
+suite automatically - fix what it reports before opening the PR. The same goes
+for a capture PR: every file in `captures/` is checked against `validate_share`
+on each run.

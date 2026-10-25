@@ -21,10 +21,14 @@ modes have three different, narrower allow-lists:
   only the DIDs those bitmaps announce (`F4xx`/`F5xx`).
 - `identify` follows the same discovery but reads only four fixed identification
   DIDs (`F187`, `F189`, `F191`, `F197`) per ECU — never the serial number (`F18C`).
+- `record` only ever sends mode-01 reads, the same OBDonUDS discovery, or a
+  profile/ECU's own `ReadDataByIdentifier` reads — all through the same
+  allow-lists as `sweep`/`obduds`.
 - VIN DIDs (`F190`, `F802`) are never read, in any mode.
 
 No write, clear-DTC, routine-control, security-access, session-control, or reset
-service is reachable through any of these paths.
+service is reachable through any of these paths. `derive` and `share` never talk
+to the adapter at all — they only read a log already on disk.
 
 That said: read-only diagnostic requests are still requests on the vehicle's bus.
 Use this with the vehicle stationary. You take on all risk by running it — this is
@@ -37,7 +41,68 @@ uv sync
 uv run pytest
 ```
 
-## Commands
+## Quick start: `record`
+
+One command for a whole outing - no address needed (it scans for a UART adapter),
+no `--state` label to pick:
+
+```
+uv run python didscout.py record
+```
+
+It connects, runs a one-time vehicle inventory (adapter, protocol, mode-01,
+OBDonUDS, manufacturer ECUs), then keeps logging every known value and
+discovering more DIDs on every known ECU while the vehicle is stationary -
+discovery pauses the moment it's moving again. Press Ctrl-C when you're done
+(e.g. back home from a drive/charge). A dropped BLE connection reconnects with
+backoff and resumes where it left off; starting `record` again later resumes
+the same unfinished run automatically (`--new` to start fresh instead).
+
+On Ctrl-C, `record` automatically runs `derive` and `share` (see below) on its
+own run directory and prints the resulting paths plus a one-line hint for how
+to contribute what it found.
+
+## `derive` and `share`
+
+`derive <RUN_DIR>` turns one `record` run's log into:
+
+- `report.md` - per module (and DID), how many samples, which byte positions
+  vary, when it changed, and whether it correlates with vehicle speed or rises/
+  falls monotonically while stationary (a charging/energy candidate).
+- `profile-draft.toml` (or `<id>.toml` with `--id`) - a candidate profile for
+  every manufacturer module with at least one DID actually found by discovery,
+  classified `once`/`watch` with an interval suggestion. Always validated via
+  `load_profile` before being written out, and skipped entirely if nothing
+  manufacturer-specific was found.
+
+```
+uv run python didscout.py derive logs/record_20260101_120000_vehicle --vehicle "my car"
+```
+
+`share <RUN_DIR>` writes a redacted `<name>.share.jsonl.gz`, safe to attach to
+a PR: connection events, adapter identity, and free-text notes are dropped;
+only `F197` keeps its decoded content among the identification DIDs; a typed
+note survives only as a canonical phase marker (`idle`/`drive`/`charge`/`park`,
+German included). See `AGENTS.md` for the exact rules `validate_share` enforces.
+
+```
+uv run python didscout.py share logs/record_20260101_120000_vehicle --vehicle "my car"
+```
+
+## Contributing what you found
+
+Two ways, see `CONTRIBUTING.md` for the full guide:
+
+- **A profile PR**: review `derive`'s draft against the display, fill in real
+  `name`s and promote `status` as you confirm values, then open a PR with the
+  resulting `profiles/<make>-<platform>.toml`.
+- **A capture PR**: run `record`, attach the `share` output under `captures/`,
+  nothing else - maintainers derive profiles from contributed captures too.
+
+## Advanced
+
+Lower-level commands for one-off, targeted runs instead of `record`'s
+continuous autonomous loop.
 
 ### `scan`
 
@@ -139,10 +204,11 @@ anything from it.
 
 ## Privacy
 
-Logs go to `logs/`, which is git-ignored, as is every `*.jsonl` file anywhere in
-the repo. Logs contain timestamps, ECU addresses, adapter/software version
-strings, and any free-text notes you typed. Redact before sharing, and never
-attach raw logs to an issue.
+Logs go to `logs/`, which is git-ignored, as is every `*.jsonl` file (and raw
+`*.jsonl.gz`) anywhere in the repo. Logs contain timestamps, ECU addresses,
+adapter/software version strings, and any free-text notes you typed. Never
+attach a raw log or `state.json` to an issue or PR - only `share`'s redacted
+output (see above) is meant to leave your machine, and only into `captures/`.
 
 ## License
 

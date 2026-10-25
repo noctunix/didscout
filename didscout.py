@@ -1703,10 +1703,19 @@ async def _inventory_protocol(link: AdapterLink, state: RunState, profile: Profi
 
 
 async def _inventory_mode01(link: AdapterLink, state: RunState, _profile: Profile | None) -> None:
+    # Mode 01 gets its own protocol choice, independent of any profile - a
+    # profile forcing protocol 6 for its own modules doesn't mean mode 01
+    # actually answers under 6 on that vehicle.
     protocol_result = state.result("protocol")
-    chosen = protocol_result.get("chosen") if isinstance(protocol_result, dict) else None
-    if chosen:
-        await link.execute(FORCE_PROTOCOL[chosen], "mode01", check_mode01_allowed)
+    answered = protocol_result.get("answered") if isinstance(protocol_result, dict) else None
+    if isinstance(answered, list) and "6" in answered:
+        mode01_protocol: str | None = "6"
+    elif isinstance(answered, list) and "7" in answered:
+        mode01_protocol = "7"
+    else:
+        mode01_protocol = None
+    if mode01_protocol:
+        await link.execute(FORCE_PROTOCOL[mode01_protocol], "mode01", check_mode01_allowed)
 
     bitmaps: list[str] = []
     for index, base in enumerate(MODE01_BITMAP_BASES):
@@ -1723,7 +1732,7 @@ async def _inventory_mode01(link: AdapterLink, state: RunState, _profile: Profil
     supported = sorted(supported_pids(bitmaps))
     for pid in supported:
         await link.execute(f"01{pid}", "mode01", check_mode01_allowed)
-    state.set_result("mode01", {"supported_pids": supported})
+    state.set_result("mode01", {"supported_pids": supported, "protocol": mode01_protocol})
 
 
 async def _inventory_obduds(link: AdapterLink, state: RunState, _profile: Profile | None) -> None:
@@ -1846,8 +1855,8 @@ def print_inventory_summary(state: RunState) -> None:
 # already knows about and, while the vehicle is stationary, discovers further
 # DIDs on every known ECU in the background - until Ctrl-C.
 RECORD_LOAD_LIMIT = 4.0  # max summed watch-poll rate, reads/second
-RECORD_SPEED_INTERVAL = 2.0
-RECORD_SPEED_MAX_AGE = 10.0
+RECORD_SPEED_INTERVAL = 5.0  # speed usually now costs a protocol switch too
+RECORD_SPEED_MAX_AGE = 12.0
 RECORD_MODE01_WATCH_INTERVAL = 10.0
 RECORD_OBDUDS_WATCH_INTERVAL = 10.0
 RECORD_DISCOVERED_WATCH_INTERVAL = 30.0
@@ -1938,6 +1947,7 @@ class RecordModule:
     isn't discoverable at all."""
 
     key: str
+    protocol: str
     setup: list[str]
     validator: Callable[[str], str]
     responder: str | None
@@ -1967,17 +1977,20 @@ class RecordWatch:
 
 def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, RecordModule]:
     """Every module `record`'s continuous loop knows about after the
-    inventory: a synthetic mode-01 module (if a protocol was chosen), every
+    inventory: a synthetic mode-01 module (if mode 01 answered at all), every
     profile module, every ECU `_inventory_ecus11` found, and every responder
-    `_inventory_obduds` found - each with its discovery progress restored from
+    `_inventory_obduds` found - each with its own protocol (mode-01 module:
+    whichever protocol answered mode 01; profile modules: `profile.protocol`;
+    ecus11: "6"; OBDonUDS: "7") and its discovery progress restored from
     `state`."""
     modules: dict[str, RecordModule] = {}
-    protocol = state.result("protocol") or {}
-    chosen = protocol.get("chosen") if isinstance(protocol, dict) else None
-    if chosen in MODE01_FUNCTIONAL_HEADER:
-        header = MODE01_FUNCTIONAL_HEADER[chosen]
+    mode01 = state.result("mode01") or {}
+    mode01_protocol = mode01.get("protocol") if isinstance(mode01, dict) else None
+    if mode01_protocol in MODE01_FUNCTIONAL_HEADER:
+        header = MODE01_FUNCTIONAL_HEADER[mode01_protocol]
         modules["mode01"] = RecordModule(
             key="mode01",
+            protocol=mode01_protocol,
             setup=["ATFCSM0", "ATAR", f"ATSH{header}"],
             validator=check_mode01_watch_allowed,
             responder=None,
@@ -1989,6 +2002,7 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             key = f"profile:{pm.id}"
             modules[key] = RecordModule(
                 key=key,
+                protocol=profile.protocol,
                 setup=module_setup_commands(pm),
                 validator=check_sweep_allowed,
                 responder=pm.response,
@@ -2007,6 +2021,7 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             synthetic = Module(id=key, request=request, dids=[], response=response)
             modules[key] = RecordModule(
                 key=key,
+                protocol="6",
                 setup=module_setup_commands(synthetic),
                 validator=check_sweep_allowed,
                 responder=response,
@@ -2022,6 +2037,7 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             synthetic = Module(id=key, request=request, dids=[], response=responder)
             modules[key] = RecordModule(
                 key=key,
+                protocol="7",
                 setup=module_setup_commands(synthetic),
                 validator=check_sweep_allowed,
                 responder=responder,
@@ -2181,6 +2197,9 @@ class RecordLoopState:
     next_due: dict[tuple[str, str], float]
     latest: dict[str, LiveValue] = field(default_factory=dict)
     current_module_key: str | None = None
+    # None after a fresh connect/reconnect: the adapter's actual protocol is
+    # unknown then, so the first module switch always sends ATSP.
+    current_protocol: str | None = None
     phase: str = "moving"
     speed_value: int | None = None
     speed_fetched: float | None = None
@@ -2215,6 +2234,9 @@ async def _record_ensure_module(link: AdapterLink, loop_state: RecordLoopState, 
     if key == loop_state.current_module_key:
         return
     module = loop_state.modules[key]
+    if module.protocol != loop_state.current_protocol:
+        await link.execute(FORCE_PROTOCOL[module.protocol], "record-setup", module.validator, None)
+        loop_state.current_protocol = module.protocol
     for cmd in module.setup:
         await link.execute(cmd, "record-setup", module.validator, None)
     loop_state.current_module_key = key

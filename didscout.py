@@ -1044,9 +1044,7 @@ async def identify(
                     ex = await execute(command, f"identify-{ecu}", responder)
                     if did == "F197" and ex.status == "OK":
                         payload = decode_positive_payload(command, ex.response, responder)
-                        value = (
-                            payload.decode("ascii", errors="replace") if payload else ex.status
-                        )
+                        value = payload.decode("ascii", errors="replace") if payload else ex.status
                     else:
                         value = ex.status
                     summary.append(f"{did}={value}")

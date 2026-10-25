@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import gzip
 import json
+import math
 import os
 import re
 import sys
@@ -821,13 +823,17 @@ def obduds_responders(response: str) -> list[str]:
     return sorted(responders)
 
 
-def decode_positive_payload(command: str, response: str, responder: str) -> bytes | None:
+def decode_positive_payload(command: str, response: str, responder: str | None) -> bytes | None:
     """Returns the data bytes of a positive ReadDataByIdentifier reply from one
-    responder, or None if no matching positive response was found."""
+    responder, or None if no matching positive response was found. `responder`
+    may be None for a single-frame-only module (no known response id), in which
+    case the first matching message is taken regardless of its header."""
     expected = bytes.fromhex(command)
     prefix = bytes([expected[0] + 0x40]) + expected[1:]
     for header, message in parse_isotp(command, response).messages:
-        if _responder_matches(header, responder) and message.startswith(prefix):
+        if (responder is None or _responder_matches(header, responder)) and message.startswith(
+            prefix
+        ):
             return message[len(prefix) :]
     return None
 
@@ -2373,6 +2379,631 @@ async def run_record_loop(
         await record_loop_tick(link, state, state_path, loop_state)
 
 
+# ---------------------------------------------------------------------------
+# derive: turn one `record` run's capture.jsonl into a profile draft + report.
+# ---------------------------------------------------------------------------
+
+# English/German free-text markers recognised in typed notes, canonicalized to
+# one of these four - never anything attempted to fully parse arbitrary notes.
+MARKER_PATTERNS: dict[str, re.Pattern[str]] = {
+    "idle": re.compile(r"\bidle\b|\bleerlauf\b", re.IGNORECASE),
+    "drive": re.compile(r"\bdriv(e|ing)\b|\bfahrt\b", re.IGNORECASE),
+    "charge": re.compile(r"\bcharg(e|ing)\b|\blad(en|ung)\b", re.IGNORECASE),
+    "park": re.compile(r"\bpark(ed|ing|en)?\b", re.IGNORECASE),
+}
+
+SPEED_COMMANDS = frozenset({"010D", "22F40D"})
+SPEED_ALIGN_SECONDS = 5.0
+DERIVE_INTERVAL_FAST = 15.0
+DERIVE_INTERVAL_SLOW = 60.0
+DERIVE_CHANGE_MEDIAN_THRESHOLD = 60.0
+DERIVE_STATIONARY_MIN_SECONDS = 600.0
+DERIVE_MODULE_HEADER_PATTERN = re.compile(r"ATSH(18DA[0-9A-F]{2}F1|[0-9A-F]{3})")
+DERIVE_RESPONSE_HEADER_PATTERN = re.compile(r"ATCRA(18DAF1[0-9A-F]{2}|[0-9A-F]{3})")
+DERIVE_DID_COMMAND_PATTERN = re.compile(r"22([0-9A-F]{4})")
+CONDITIONAL_STATUSES = frozenset({"NRC 22 conditionsNotCorrect", "NRC 33 securityAccessDenied"})
+
+
+def classify_note_marker(text: str) -> str | None:
+    """Canonicalizes a typed note to one of MARKER_PATTERNS's keys, or None if
+    it doesn't match exactly one of them - an ambiguous or unrelated note is
+    never treated as a phase marker."""
+    matches = [name for name, pattern in MARKER_PATTERNS.items() if pattern.search(text)]
+    return matches[0] if len(matches) == 1 else None
+
+
+@dataclass
+class DidSample:
+    t: float
+    payload: bytes
+    phase: str
+
+
+@dataclass
+class DidRecord:
+    did: str
+    samples: list[DidSample] = field(default_factory=list)
+    from_discovery: bool = False
+    conditional: bool = False
+
+
+@dataclass
+class ModuleRecord:
+    request: str | None
+    response: str | None
+    dids: dict[str, DidRecord] = field(default_factory=dict)
+
+
+@dataclass
+class DerivedData:
+    modules: dict[tuple[str | None, str | None], ModuleRecord]
+    speed_series: list[tuple[float, int]]
+
+
+def _entry_seconds(entry: dict[str, object], origin: datetime | None) -> float:
+    if origin is None:
+        return 0.0
+    ts = entry.get("started_utc")
+    if not isinstance(ts, str) or not ts:
+        return 0.0
+    return (datetime.fromisoformat(ts) - origin).total_seconds()
+
+
+def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
+    """Replays a capture log in order, grouping every ReadDataByIdentifier
+    exchange by the CAN header pair active at the time (tracked from the
+    `ATSH`/`ATCRA` commands that precede it - the log alone is enough, no
+    `state.json` or `--profile` needed). Mode-01 reads never match the 22xxxx
+    pattern and OBDonUDS support-bitmap reads never carry a `discover-` stage,
+    so both are naturally excluded from anything `from_discovery` cares about."""
+    modules: dict[tuple[str | None, str | None], ModuleRecord] = {}
+    speed_series: list[tuple[float, int]] = []
+    origin: datetime | None = None
+    current_request: str | None = None
+    current_response: str | None = None
+    current_phase = "moving"
+
+    for entry in entries:
+        ts = entry.get("started_utc")
+        if origin is None and isinstance(ts, str) and ts:
+            origin = datetime.fromisoformat(ts)
+        t = _entry_seconds(entry, origin)
+        command = str(entry.get("command", ""))
+        status = str(entry.get("status", ""))
+        response_raw = str(entry.get("response", ""))
+        stage = str(entry.get("stage", ""))
+
+        header_match = DERIVE_MODULE_HEADER_PATTERN.fullmatch(command)
+        if header_match:
+            current_request = header_match.group(1)
+            current_response = None
+            continue
+        response_header_match = DERIVE_RESPONSE_HEADER_PATTERN.fullmatch(command)
+        if response_header_match:
+            current_response = response_header_match.group(1)
+            continue
+        if command == "PHASE":
+            current_phase = response_raw.strip().lower() or current_phase
+            continue
+        if command == "NOTE":
+            marker = classify_note_marker(response_raw)
+            if marker is not None:
+                current_phase = marker
+            continue
+
+        if command in SPEED_COMMANDS and status == "OK":
+            speed = decode_speed(
+                command, Exchange(command, response_raw, status, "", 0.0), current_response
+            )
+            if speed is not None:
+                speed_series.append((t, speed))
+
+        did_match = DERIVE_DID_COMMAND_PATTERN.fullmatch(command)
+        if not did_match:
+            continue
+        did = did_match.group(1)
+        if did in VIN_DIDS:
+            continue
+        key = (current_request, current_response)
+        module = modules.setdefault(key, ModuleRecord(current_request, current_response))
+        record = module.dids.setdefault(did, DidRecord(did))
+        if stage.startswith("discover-"):
+            record.from_discovery = True
+        if status in CONDITIONAL_STATUSES:
+            record.conditional = True
+            continue
+        if status != "OK":
+            continue
+        payload = decode_positive_payload(command, response_raw, current_response)
+        if payload:
+            record.samples.append(DidSample(t, payload, current_phase))
+
+    return DerivedData(modules, speed_series)
+
+
+def _most_common_length(payloads: list[bytes]) -> int:
+    counts: dict[int, int] = {}
+    for payload in payloads:
+        counts[len(payload)] = counts.get(len(payload), 0) + 1
+    return max(counts, key=lambda length: counts[length])
+
+
+def _varying_byte_positions(payloads: list[bytes]) -> dict[int, tuple[int, int]]:
+    length = _most_common_length(payloads)
+    same_length = [p for p in payloads if len(p) == length]
+    varying: dict[int, tuple[int, int]] = {}
+    for pos in range(length):
+        values = [p[pos] for p in same_length]
+        if min(values) != max(values):
+            varying[pos] = (min(values), max(values))
+    return varying
+
+
+def _classify_did(record: DidRecord) -> tuple[str, float | None]:
+    """'once' if every sample carries the same payload, else 'watch' with an
+    interval suggestion: 15s if the median gap between value changes is under
+    a minute, else 60s."""
+    if len({s.payload for s in record.samples}) <= 1:
+        return "once", None
+    change_times = [
+        s.t
+        for i, s in enumerate(record.samples)
+        if i > 0 and s.payload != record.samples[i - 1].payload
+    ]
+    if len(change_times) >= 2:
+        gaps = sorted(b - a for a, b in zip(change_times, change_times[1:]))
+        mid = len(gaps) // 2
+        median_gap = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
+    else:
+        median_gap = 0.0
+    interval = (
+        DERIVE_INTERVAL_FAST if median_gap < DERIVE_CHANGE_MEDIAN_THRESHOLD else DERIVE_INTERVAL_SLOW
+    )
+    return "watch", interval
+
+
+def _changed_phases(record: DidRecord) -> set[str]:
+    return {
+        s.phase
+        for i, s in enumerate(record.samples)
+        if i > 0 and s.payload != record.samples[i - 1].payload
+    }
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    n = len(xs)
+    if n < 3:
+        return None
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x == 0 or var_y == 0:
+        return None
+    return cov / math.sqrt(var_x * var_y)
+
+
+def _align_to_speed(
+    points: list[tuple[float, int]], speed_series: list[tuple[float, int]]
+) -> tuple[list[float], list[float]]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for t, value in points:
+        best: int | None = None
+        best_dt = SPEED_ALIGN_SECONDS
+        for st, sv in speed_series:
+            dt = abs(st - t)
+            if dt <= best_dt:
+                best_dt, best = dt, sv
+        if best is not None:
+            xs.append(float(value))
+            ys.append(float(best))
+    return xs, ys
+
+
+def speed_correlation(
+    record: DidRecord, speed_series: list[tuple[float, int]]
+) -> tuple[int, int, float] | None:
+    """Strongest |Pearson r| of any 1- or 2-byte big-endian field in `record`'s
+    most common payload length against `speed_series`, time-aligned to within
+    SPEED_ALIGN_SECONDS - or None if there's nothing to align against."""
+    if not speed_series or not record.samples:
+        return None
+    length = _most_common_length([s.payload for s in record.samples])
+    best: tuple[int, int, float] | None = None
+    for width in (1, 2):
+        for offset in range(0, length - width + 1):
+            points = [
+                (s.t, int.from_bytes(s.payload[offset : offset + width], "big"))
+                for s in record.samples
+                if len(s.payload) >= offset + width
+            ]
+            xs, ys = _align_to_speed(points, speed_series)
+            r = _pearson(xs, ys)
+            if r is not None and (best is None or abs(r) > abs(best[2])):
+                best = (offset, width, r)
+    return best
+
+
+def stationary_monotonic_candidates(record: DidRecord) -> list[tuple[int, int, str, float]]:
+    """Fields that rise or fall monotonically while stationary for at least
+    DERIVE_STATIONARY_MIN_SECONDS - candidates for a charging/energy value."""
+    stationary = [s for s in record.samples if s.phase == "stationary"]
+    if len(stationary) < 2 or stationary[-1].t - stationary[0].t < DERIVE_STATIONARY_MIN_SECONDS:
+        return []
+    length = _most_common_length([s.payload for s in stationary])
+    duration = stationary[-1].t - stationary[0].t
+    found: list[tuple[int, int, str, float]] = []
+    for width in (1, 2):
+        for offset in range(0, length - width + 1):
+            values = [
+                int.from_bytes(s.payload[offset : offset + width], "big")
+                for s in stationary
+                if len(s.payload) >= offset + width
+            ]
+            if len(values) < 2 or values[0] == values[-1]:
+                continue
+            if all(a <= b for a, b in zip(values, values[1:])):
+                found.append((offset, width, "rising", duration))
+            elif all(a >= b for a, b in zip(values, values[1:])):
+                found.append((offset, width, "falling", duration))
+    return found
+
+
+def _module_label(request: str | None, response: str | None) -> str:
+    req = request or "unknown"
+    return f"{req}/{response}" if response else req
+
+
+def _system_name(module: ModuleRecord) -> str:
+    record = module.dids.get("F197")
+    if record is None or not record.samples:
+        return "unknown"
+    try:
+        name = record.samples[-1].payload.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return "unknown"
+    return name or "unknown"
+
+
+@dataclass
+class DraftModule:
+    id: str
+    request: str
+    response: str | None
+    protocol: str
+    dids: list[tuple[str, str, float | None]]
+
+
+def build_draft_modules(modules: dict[tuple[str | None, str | None], ModuleRecord]) -> list[DraftModule]:
+    """Manufacturer modules eligible for the draft profile: any header pair
+    with at least one DID that was actually found by discovery (a `discover-`
+    stage entry) and read positively at least once. Mode-01 PIDs and announced
+    OBDonUDS F4xx/F5xx DIDs never carry a `discover-` stage, so they never
+    qualify - only genuinely new, manufacturer-specific finds do."""
+    drafts: list[DraftModule] = []
+    for (request, response), module in modules.items():
+        if request is None:
+            continue
+        eligible = sorted(
+            did
+            for did, record in module.dids.items()
+            if record.from_discovery and record.samples
+        )
+        if not eligible:
+            continue
+        protocol = "7" if len(request) == 8 else "6"
+        dids: list[tuple[str, str, float | None]] = []
+        for did in eligible:
+            poll, interval = _classify_did(module.dids[did])
+            dids.append((did, poll, interval))
+        drafts.append(DraftModule(f"ecu-{request.lower()}", request, response, protocol, dids))
+    return sorted(drafts, key=lambda m: m.id)
+
+
+def _choose_profile_protocol(drafts: list[DraftModule]) -> str:
+    if not drafts:
+        return "6"
+    counts = {"6": 0, "7": 0}
+    for module in drafts:
+        counts[module.protocol] += 1
+    return "7" if counts["7"] > counts["6"] else "6"
+
+
+def _toml_str(value: str) -> str:
+    return json.dumps(value)
+
+
+def render_profile_draft_toml(*, profile_id: str, vehicle: str, drafts: list[DraftModule]) -> str:
+    protocol = _choose_profile_protocol(drafts)
+    lines = [
+        "schema = 1",
+        f"id = {_toml_str(profile_id)}",
+        f"name = {_toml_str(f'{vehicle} (draft)')}",
+        f"description = {_toml_str('Draft profile generated by didscout derive - review every DID before use.')}",
+        f"protocol = {_toml_str(protocol)}",
+        f"vehicles = [{_toml_str(vehicle)}]",
+        "",
+        "[[sources]]",
+        f"title = {_toml_str('own discovery (didscout record)')}",
+        'url = "https://github.com/noctunix/didscout"',
+        'license = "own discovery"',
+    ]
+    for module in drafts:
+        lines += ["", "[[modules]]", f"id = {_toml_str(module.id)}", f"request = {_toml_str(module.request)}"]
+        if module.response:
+            lines.append(f"response = {_toml_str(module.response)}")
+        if module.protocol != protocol:
+            lines.append(f"protocol = {_toml_str(module.protocol)}")
+        for did, poll, interval in module.dids:
+            lines += [
+                "",
+                "[[modules.dids]]",
+                f"did = {_toml_str(did)}",
+                'status = "unverified"',
+                f"poll = {_toml_str(poll)}",
+            ]
+            if interval is not None:
+                lines.append(f"interval = {interval:.0f}")
+    return "\n".join(lines) + "\n"
+
+
+def render_derive_report(data: DerivedData, vehicle: str, source: Path) -> str:
+    modules = sorted(data.modules.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or ""))
+    speed_candidates: list[tuple[str, str, int, int, float]] = []
+    stationary_candidates: list[tuple[str, str, int, int, str, float]] = []
+    for (request, response), module in modules:
+        label = _module_label(request, response)
+        for did, record in sorted(module.dids.items()):
+            corr = speed_correlation(record, data.speed_series)
+            if corr is not None and abs(corr[2]) >= 0.5:
+                speed_candidates.append((label, did, corr[0], corr[1], corr[2]))
+            for offset, width, direction, duration in stationary_monotonic_candidates(record):
+                stationary_candidates.append((label, did, offset, width, direction, duration))
+    speed_candidates.sort(key=lambda c: -abs(c[4]))
+
+    lines = [
+        "# didscout derive report",
+        "",
+        f"Source: `{source}`",
+        f"Vehicle: {vehicle}",
+        f"Generated: {datetime.now(UTC).isoformat()}",
+        "",
+        "## Candidates",
+        "",
+        "### Speed-correlated fields",
+        "",
+    ]
+    if speed_candidates:
+        for label, did, offset, width, r in speed_candidates:
+            lines.append(f"- {label} DID {did}: offset {offset} width {width}, r={r:+.2f}")
+    else:
+        lines.append("- none found")
+    lines += ["", "### Stationary rise/fall (charging/energy candidates)", ""]
+    if stationary_candidates:
+        for label, did, offset, width, direction, duration in stationary_candidates:
+            lines.append(
+                f"- {label} DID {did}: offset {offset} width {width}, {direction} over "
+                f"{duration:.0f}s"
+            )
+    else:
+        lines.append("- none found")
+
+    lines += ["", "## Modules", ""]
+    for (request, response), module in modules:
+        label = _module_label(request, response)
+        lines += [f"### {label} - system: {_system_name(module)}", ""]
+        for did, record in sorted(module.dids.items()):
+            if not record.samples and not record.conditional:
+                continue
+            header = f"#### DID {did}" + (" (conditional)" if record.conditional else "")
+            lines.append(header)
+            if not record.samples:
+                lines += ["- NRC 22/33 only; no positive read", ""]
+                continue
+            payloads = [s.payload for s in record.samples]
+            distinct = {p.hex() for p in payloads}
+            lines.append(f"- samples: {len(record.samples)}, distinct values: {len(distinct)}")
+            varying = _varying_byte_positions(payloads)
+            if varying:
+                positions = ", ".join(
+                    f"{pos} (min {lo:02X} max {hi:02X})" for pos, (lo, hi) in sorted(varying.items())
+                )
+                lines.append(f"- varying byte positions: {positions}")
+            else:
+                lines.append("- varying byte positions: none (constant)")
+            phases = _changed_phases(record)
+            if phases:
+                shown = ", ".join(
+                    sorted(p.upper() if p in ("moving", "stationary") else p for p in phases)
+                )
+                lines.append(f"- changed during: {shown}")
+            corr = speed_correlation(record, data.speed_series)
+            if corr is not None:
+                offset, width, r = corr
+                lines.append(f"- speed correlation: r={r:+.2f} at offset {offset} width {width}")
+            else:
+                lines.append("- speed correlation: none")
+            poll, interval = _classify_did(record)
+            if record.from_discovery:
+                suggestion = f"poll={poll}" + (f" interval={interval:.0f}s" if interval else "")
+                lines.append(f"- draft classification: {suggestion}")
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def resolve_capture_path(run_dir_or_file: Path) -> Path:
+    path = Path(run_dir_or_file)
+    return path / "capture.jsonl" if path.is_dir() else path
+
+
+def read_capture_entries(capture_path: Path) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for line in capture_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            entries.append(json.loads(line))
+    return entries
+
+
+def derive(
+    run_dir_or_file: Path,
+    *,
+    id_: str | None = None,
+    vehicle: str | None = None,
+    out: Path | None = None,
+) -> tuple[Path | None, Path]:
+    """Writes `<id>.toml` (a profile draft, `profile-draft.toml` by default)
+    and `report.md` from one `record` run's capture log. Returns
+    `(profile_path, report_path)` - `profile_path` is None if nothing
+    manufacturer-specific was found by discovery, since an empty profile would
+    never pass `load_profile` anyway. The written draft is always loaded back
+    through `load_profile` before returning, so a broken draft fails loudly
+    here rather than silently reaching a PR."""
+    capture_path = resolve_capture_path(run_dir_or_file)
+    entries = read_capture_entries(capture_path)
+    data = analyze_capture(entries)
+    drafts = build_draft_modules(data.modules)
+    vehicle_name = vehicle or "unknown vehicle"
+    profile_id = id_ or "profile-draft"
+    out_dir = out or capture_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    report_path = out_dir / "report.md"
+    report_path.write_text(
+        render_derive_report(data, vehicle_name, run_dir_or_file), encoding="utf-8"
+    )
+
+    profile_path: Path | None = None
+    if drafts:
+        profile_path = out_dir / f"{profile_id}.toml"
+        profile_path.write_text(
+            render_profile_draft_toml(profile_id=profile_id, vehicle=vehicle_name, drafts=drafts),
+            encoding="utf-8",
+        )
+        load_profile(profile_path)
+    return profile_path, report_path
+
+
+# ---------------------------------------------------------------------------
+# share: a redacted capture, safe to publish, for others to derive profiles
+# from without ever seeing a raw log.
+# ---------------------------------------------------------------------------
+
+ADAPTER_IDENTITY_COMMANDS = frozenset({"ATI", "STI", "STDI"})
+IDENTITY_DID_COMMANDS = frozenset({"22F187", "22F189", "22F191"})
+SHARE_ENTRY_KEYS = frozenset({"t", "stage", "module", "command", "status", "response"})
+ISO_TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _redact_entry(entry: dict[str, object], origin: datetime | None) -> dict[str, object] | None:
+    """One capture entry, redacted for `share`, or None if it must be dropped
+    entirely - see `AGENTS.md`/`CONTRIBUTING.md` for what a shared capture may
+    and may never contain."""
+    command = str(entry.get("command", ""))
+    stage = str(entry.get("stage", ""))
+    if stage == "connection" or command in ADAPTER_IDENTITY_COMMANDS:
+        return None
+    if command == "NOTE":
+        marker = classify_note_marker(str(entry.get("response", "")))
+        if marker is None:
+            return None
+        return {
+            "t": round(_entry_seconds(entry, origin), 1),
+            "stage": "phase",
+            "status": "MARKER",
+            "response": marker,
+        }
+
+    out: dict[str, object] = {"t": round(_entry_seconds(entry, origin), 1), "stage": stage}
+    module = entry.get("module")
+    if module is not None:
+        out["module"] = module
+    out["command"] = command
+    out["status"] = entry.get("status")
+    if command not in IDENTITY_DID_COMMANDS:
+        out["response"] = entry.get("response")
+    return out
+
+
+def share(
+    run_dir_or_file: Path, *, vehicle: str | None = None, out: Path | None = None
+) -> Path:
+    """Writes a redacted `<name>.share.jsonl.gz`, safe to attach to a PR under
+    `captures/` - see `validate_share` for the rules it enforces."""
+    capture_path = resolve_capture_path(run_dir_or_file)
+    entries = read_capture_entries(capture_path)
+    origin: datetime | None = None
+    for entry in entries:
+        ts = entry.get("started_utc")
+        if isinstance(ts, str) and ts:
+            origin = datetime.fromisoformat(ts)
+            break
+
+    vehicle_name = vehicle or "unknown vehicle"
+    if out is not None:
+        out_path = out
+    else:
+        name = Path(run_dir_or_file).stem if Path(run_dir_or_file).is_file() else capture_path.parent.name
+        out_path = capture_path.parent / f"{name}.share.jsonl.gz"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with gzip.open(out_path, "wt", encoding="utf-8") as handle:
+        handle.write(json.dumps({"didscout_share": 1, "vehicle": vehicle_name}) + "\n")
+        for entry in entries:
+            redacted = _redact_entry(entry, origin)
+            if redacted is not None:
+                handle.write(json.dumps(redacted, ensure_ascii=False) + "\n")
+    return out_path
+
+
+def _scan_share_value(value: object, path: Path, index: int) -> None:
+    if isinstance(value, str):
+        if ISO_TIMESTAMP_PATTERN.search(value):
+            raise ValueError(f"{path}: line {index}: absolute-time-looking value {value!r}")
+        if VIN_LIKE_PATTERN.fullmatch(value):
+            raise ValueError(f"{path}: line {index}: VIN-like string {value!r}")
+    elif isinstance(value, dict):
+        for item in value.values():
+            _scan_share_value(item, path, index)
+    elif isinstance(value, list):
+        for item in value:
+            _scan_share_value(item, path, index)
+
+
+def validate_share(path: Path) -> None:
+    """Raises ValueError on any violation of the `share` format: unknown keys,
+    absolute-time-looking values, non-marker notes, identification payloads,
+    or a VIN-like 17-character string anywhere. Run by the test suite against
+    every file in `captures/`."""
+    path = Path(path)
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        lines = [json.loads(line) for line in handle if line.strip()]
+    if not lines:
+        raise ValueError(f"{path}: empty share file")
+    header = lines[0]
+    if not isinstance(header, dict) or set(header) != {"didscout_share", "vehicle"}:
+        raise ValueError(f"{path}: invalid header {header!r}")
+    if header.get("didscout_share") != 1:
+        raise ValueError(f"{path}: header didscout_share must be 1")
+    if not isinstance(header.get("vehicle"), str) or not header["vehicle"]:
+        raise ValueError(f"{path}: header vehicle must be a non-empty string")
+
+    for index, entry in enumerate(lines[1:], start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: line {index}: not an object")
+        unknown = set(entry) - SHARE_ENTRY_KEYS
+        if unknown:
+            raise ValueError(f"{path}: line {index}: unknown key(s) {sorted(unknown)}")
+        if entry.get("command") == "NOTE":
+            raise ValueError(f"{path}: line {index}: raw note leaked into share output")
+        if entry.get("command") in IDENTITY_DID_COMMANDS and "response" in entry:
+            raise ValueError(f"{path}: line {index}: identification payload present")
+        if entry.get("stage") == "phase" and entry.get("status") == "MARKER":
+            if entry.get("response") not in MARKER_PATTERNS:
+                raise ValueError(f"{path}: line {index}: not a recognised phase marker")
+        _scan_share_value(entry, path, index)
+
+
 RECORD_INITIAL_BACKOFF = 5.0
 RECORD_MAX_BACKOFF = 60.0
 
@@ -2479,6 +3110,22 @@ async def record(
                     # finished stays False: the next `record` start resumes
                     # discovery exactly where this run left off.
                     state.save(state_path)
+                    try:
+                        profile_path, report_path = derive(run_dir)
+                        share_path = share(run_dir)
+                        print(f"[record] report: {report_path}")
+                        print(
+                            f"[record] profile draft: {profile_path}"
+                            if profile_path
+                            else "[record] profile draft: none (no manufacturer DIDs discovered yet)"
+                        )
+                        print(f"[record] share: {share_path}")
+                        print(
+                            "[record] contribute: open a profile PR with the draft, or a capture "
+                            "PR with the share file in captures/ - see CONTRIBUTING.md"
+                        )
+                    except Exception as error:
+                        print(f"[record] derive/share failed: {error}", file=sys.stderr)
                     return 130
         except ProbeAbortedError as error:
             _log_connection_event(log_path, label, "DISCONNECTED", str(error))
@@ -2643,6 +3290,21 @@ def main(argv: list[str]) -> int:
     r.add_argument(
         "--new", action="store_true", help="start a fresh run instead of resuming an unfinished one"
     )
+    d = sub.add_parser(
+        "derive",
+        help="write a profile draft + report.md from one `record` run's capture log",
+    )
+    d.add_argument("run", type=Path, help="a `record` run directory, or its capture.jsonl")
+    d.add_argument("--id", help="profile id for the draft (default: profile-draft)")
+    d.add_argument("--vehicle", help="vehicle name for the draft/report (default: unknown vehicle)")
+    d.add_argument("--out", type=Path, help="output directory (default: the run directory)")
+    sh = sub.add_parser(
+        "share",
+        help="write a redacted <name>.share.jsonl.gz, safe to attach to a captures/ PR",
+    )
+    sh.add_argument("run", type=Path, help="a `record` run directory, or its capture.jsonl")
+    sh.add_argument("--vehicle", help="vehicle name for the share header (default: unknown vehicle)")
+    sh.add_argument("--out", type=Path, help="output file path (default: <name>.share.jsonl.gz)")
     p = sub.add_parser("probe", help="run allow-listed stages against the adapter")
     p.add_argument("address", help="BLE address from `scan`")
     p.add_argument(
@@ -2787,6 +3449,29 @@ def main(argv: list[str]) -> int:
                 parser.error(str(error))
         record_label = re.sub(r"[^a-z0-9_-]", "", args.label.lower()) or "vehicle"
         return asyncio.run(record(args.address, profile, record_label, args.out, args.new))
+    if args.mode == "derive":
+        try:
+            profile_path, report_path = derive(
+                args.run, id_=args.id, vehicle=args.vehicle, out=args.out
+            )
+        except (ProfileError, OSError, ValueError) as error:
+            print(f"derive failed: {error}", file=sys.stderr)
+            return 2
+        print(f"report: {report_path}")
+        print(
+            f"profile draft: {profile_path}"
+            if profile_path
+            else "profile draft: none (no manufacturer DIDs discovered yet)"
+        )
+        return 0
+    if args.mode == "share":
+        try:
+            share_path = share(args.run, vehicle=args.vehicle, out=args.out)
+        except OSError as error:
+            print(f"share failed: {error}", file=sys.stderr)
+            return 2
+        print(f"share: {share_path}")
+        return 0
     label = re.sub(r"[^a-z0-9_-]", "", args.state.lower()) or "unlabeled"
     if args.mode == "obduds":
         return asyncio.run(

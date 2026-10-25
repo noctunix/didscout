@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 
@@ -2091,3 +2093,378 @@ def test_record_loop_switches_protocol_between_modules_without_redundant_atsp(
     asyncio.run(scenario())
 
     assert atsp_sent == ["ATSP7", "ATSP6", "ATSP7"]
+
+
+def _hex_reply(header: str, message: bytes) -> str:
+    data = bytes([len(message)]) + message
+    return header + data.hex().upper()
+
+
+def _capture_entry(
+    base: datetime,
+    t: float,
+    stage: str,
+    command: str,
+    status: str,
+    response: str,
+    module: str | None = None,
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "stage": stage,
+        "state": "vehicle",
+        "mtu": 23,
+        "command": command,
+        "response": response,
+        "status": status,
+        "started_utc": (base + timedelta(seconds=t)).isoformat(),
+        "duration_ms": 10.0,
+    }
+    if module is not None:
+        entry["module"] = module
+    return entry
+
+
+def _write_capture(run_dir: Path, entries: list[dict[str, object]]) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "capture.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    return path
+
+
+def _synthetic_capture(base: datetime) -> list[dict[str, object]]:
+    """A small, hand-built `record` capture exercising everything `derive`
+    classifies: a constant DID, a fast-changing DID correlated with speed, a
+    conditional-only DID, and a DID rising monotonically while stationary for
+    over ten minutes."""
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH710", "OK", "OK"),
+        _capture_entry(base, 0.5, "record-setup", "ATCRA77A", "OK", "OK"),
+    ]
+    t = 1.0
+    for i in range(5):
+        stage = "discover-profile:gateway" if i == 0 else "watch"
+        entries.append(
+            _capture_entry(
+                base,
+                t,
+                stage,
+                "222A10",
+                "OK",
+                _hex_reply("77A", bytes([0x62, 0x2A, 0x10, 0xAA])),
+                "profile:gateway",
+            )
+        )
+        t += 10
+    for i in range(10):
+        val = i * 5
+        stage = "discover-profile:gateway" if i == 0 else "watch"
+        entries.append(
+            _capture_entry(
+                base,
+                t,
+                stage,
+                "222A20",
+                "OK",
+                _hex_reply("77A", bytes([0x62, 0x2A, 0x20, val])),
+                "profile:gateway",
+            )
+        )
+        t += 0.2
+        entries.append(
+            _capture_entry(
+                base, t, "watch", "010D", "OK", _hex_reply("7E8", bytes([0x41, 0x0D, val]))
+            )
+        )
+        t += 10
+    entries.append(
+        _capture_entry(
+            base,
+            t,
+            "discover-profile:gateway",
+            "222A30",
+            "NRC 22 conditionsNotCorrect",
+            _hex_reply("77A", bytes([0x7F, 0x22, 0x22])),
+            "profile:gateway",
+        )
+    )
+    t += 10
+    entries.append(_capture_entry(base, t, "phase", "PHASE", "STATIONARY", "stationary"))
+    t += 0.1
+    for i in range(5):
+        stage = "discover-profile:gateway" if i == 0 else "watch"
+        entries.append(
+            _capture_entry(
+                base,
+                t,
+                stage,
+                "222A40",
+                "OK",
+                _hex_reply("77A", bytes([0x62, 0x2A, 0x40, i * 10])),
+                "profile:gateway",
+            )
+        )
+        t += 700
+    return entries
+
+
+def test_derive_classifies_constant_and_changing_dids(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    _write_capture(run_dir, _synthetic_capture(base))
+
+    profile_path, report_path = cx.derive(run_dir, vehicle="Test Car")
+    assert profile_path is not None
+    profile = cx.load_profile(profile_path)
+    module = next(m for m in profile.modules if m.id == "ecu-710")
+    by_did = {d.did: d for d in module.dids}
+    assert by_did["2A10"].poll == "once"
+    assert by_did["2A20"].poll == "watch"
+    assert by_did["2A20"].interval == 15.0  # changes every ~10s, well under a minute
+    assert by_did["2A40"].poll == "watch"
+    assert by_did["2A40"].interval == 60.0  # changes every ~700s
+    assert "2A30" not in by_did  # conditional-only, never positively read
+
+    report = report_path.read_text()
+    assert "2A30" in report and "conditional" in report
+    assert "2A20" in report
+
+
+def test_derive_detects_speed_correlation_and_stationary_rise(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    _write_capture(run_dir, _synthetic_capture(base))
+
+    _profile_path, report_path = cx.derive(run_dir, vehicle="Test Car")
+    report = report_path.read_text()
+    assert "Speed-correlated fields" in report
+    assert "2A20" in report.split("Speed-correlated fields")[1].split("###")[0]
+    assert "Stationary rise/fall" in report
+
+
+def test_derive_writes_nothing_when_no_dids_were_discovered(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH7DF", "OK", "OK"),
+        _capture_entry(base, 1, "watch", "010D", "OK", _hex_reply("7E8", bytes([0x41, 0x0D, 0]))),
+    ]
+    _write_capture(run_dir, entries)
+
+    profile_path, report_path = cx.derive(run_dir, vehicle="Test Car")
+    assert profile_path is None
+    assert report_path.exists()
+
+
+def test_derive_rejects_capture_path_directly(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    capture_path = _write_capture(run_dir, _synthetic_capture(base))
+
+    profile_path, report_path = cx.derive(capture_path, vehicle="Test Car")
+    assert profile_path is not None
+    assert report_path.parent == run_dir
+
+
+def test_classify_note_marker_recognises_english_and_german() -> None:
+    assert cx.classify_note_marker("starting to charge now") == "charge"
+    assert cx.classify_note_marker("jetzt laden") == "charge"
+    assert cx.classify_note_marker("im Leerlauf") == "idle"
+    assert cx.classify_note_marker("Fahrt beginnt") == "drive"
+    assert cx.classify_note_marker("parken") == "park"
+    assert cx.classify_note_marker("odometer 12345") is None
+    assert cx.classify_note_marker("idle but also driving") is None  # ambiguous
+
+
+def test_share_redacts_identity_connection_and_non_marker_notes(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    entries = [
+        _capture_entry(base, 0, "connection", "CONNECTION", "CONNECTED", ""),
+        _capture_entry(base, 0.1, "adapter", "ATI", "RESPONSE", "OBDLink CX v4.3.1"),
+        _capture_entry(base, 0.2, "identify-10", "22F189", "OK", "77A0462F18941"),
+        _capture_entry(base, 0.3, "identify-10", "22F197", "OK", "77A0962F19754617465"),
+        _capture_entry(base, 0.4, "display", "NOTE", "NOTE", "odometer reads 84213 km"),
+        _capture_entry(base, 0.5, "display", "NOTE", "NOTE", "now charging at home"),
+        _capture_entry(base, 0.6, "watch", "222A20", "OK", "77A04622A2005", "profile:gateway"),
+    ]
+    _write_capture(run_dir, entries)
+
+    share_path = cx.share(run_dir, vehicle="Test Car")
+    cx.validate_share(share_path)
+
+    with gzip.open(share_path, "rt", encoding="utf-8") as handle:
+        lines = [json.loads(line) for line in handle]
+
+    header = lines[0]
+    assert header == {"didscout_share": 1, "vehicle": "Test Car"}
+    bodies = lines[1:]
+    commands = [entry.get("command") for entry in bodies]
+    assert "CONNECTION" not in commands
+    assert "ATI" not in commands
+    assert "NOTE" not in commands  # the odometer note is dropped entirely
+    assert all("started_utc" not in e and "state" not in e and "mtu" not in e for e in bodies)
+
+    f189_entry = next(e for e in bodies if e.get("command") == "22F189")
+    assert "response" not in f189_entry and f189_entry["status"] == "OK"
+    f197_entry = next(e for e in bodies if e.get("command") == "22F197")
+    assert f197_entry["response"] == "77A0962F19754617465"  # F197 stays
+
+    marker_entry = next(e for e in bodies if e.get("status") == "MARKER")
+    assert marker_entry == {"t": 0.5, "stage": "phase", "status": "MARKER", "response": "charge"}
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate"),
+    [
+        ("unknown_key", lambda e: {**e, "address": "AA:BB:CC:DD:EE:FF"}),
+        ("raw_note", lambda e: {**e, "command": "NOTE", "response": "odometer 12345"}),
+        (
+            "identification_payload",
+            lambda e: {**e, "command": "22F189", "response": "77A0462F18941"},
+        ),
+        (
+            "non_marker_phase_status",
+            lambda e: {**e, "stage": "phase", "status": "MARKER", "response": "lunch break"},
+        ),
+        ("absolute_timestamp", lambda e: {**e, "response": "2026-10-25T12:00:00+00:00"}),
+        ("vin_like_string", lambda e: {**e, "response": "WVWZZZ1KZAW123456"}),
+    ],
+)
+def test_validate_share_rejects_each_violation(
+    tmp_path: Path, name: str, mutate: Callable[[dict[str, object]], dict[str, object]]
+) -> None:
+    base_entry = {
+        "t": 1.0,
+        "stage": "watch",
+        "module": "profile:gateway",
+        "command": "222A20",
+        "status": "OK",
+        "response": "77A04622A2005",
+    }
+    path = tmp_path / "broken.share.jsonl.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        handle.write(json.dumps({"didscout_share": 1, "vehicle": "Test"}) + "\n")
+        handle.write(json.dumps(mutate(base_entry)) + "\n")
+    with pytest.raises(ValueError):
+        cx.validate_share(path)
+
+
+def test_validate_share_accepts_a_clean_file(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    _write_capture(run_dir, _synthetic_capture(base))
+    share_path = cx.share(run_dir, vehicle="Test Car")
+    cx.validate_share(share_path)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "path", sorted((Path(__file__).parent / "captures").glob("*.share.jsonl.gz"))
+)
+def test_contributed_captures_pass_validate_share(path: Path) -> None:
+    cx.validate_share(path)
+
+
+def test_record_ctrl_c_runs_derive_and_share_on_its_own_run_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile_path = tmp_path / "testgw.toml"
+    profile_path.write_text(
+        """
+        schema = 1
+        id = "testgw"
+        name = "Test gateway"
+        description = "Test fixture"
+        protocol = "6"
+        vehicles = ["Test vehicle"]
+
+        [[sources]]
+        title = "Test"
+        url = "https://example.com"
+        license = "own discovery"
+
+        [[modules]]
+        id = "gateway"
+        request = "710"
+        response = "77A"
+        discover = [["2AB6", "2AB6"]]
+
+        [[modules.dids]]
+        did = "2AB6"
+        name = "range remaining"
+        status = "validated"
+        poll = "watch"
+        interval = 60
+        """
+    )
+    profile = cx.load_profile(profile_path)
+
+    watched = asyncio.Event()
+
+    def responder(cmd: str) -> bytes:
+        if cmd == "ATZ":
+            return b"ELM327 v1.4\r>"
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if cmd == "222AB6":
+            watched.set()
+            return b"77A04622AB6AA\r>"
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    async def fake_adapter(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("adapter", {})
+
+    async def fake_protocol(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("protocol", {"answered": ["6"], "chosen": "6"})
+
+    async def fake_mode01(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("mode01", {"supported_pids": [], "protocol": None})
+
+    async def fake_obduds(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("obduds", {})
+
+    async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus11", {})
+
+    monkeypatch.setattr(
+        cx,
+        "INVENTORY_STAGE_FUNCS",
+        {
+            "adapter": fake_adapter,
+            "protocol": fake_protocol,
+            "mode01": fake_mode01,
+            "obduds": fake_obduds,
+            "ecus11": fake_ecus11,
+        },
+    )
+
+    calls: list[str] = []
+    real_derive = cx.derive
+    real_share = cx.share
+
+    def tracking_derive(run_dir: Path, **kwargs: object) -> tuple[Path | None, Path]:
+        calls.append(f"derive:{run_dir.name}")
+        return real_derive(run_dir, **kwargs)
+
+    def tracking_share(run_dir: Path, **kwargs: object) -> Path:
+        calls.append(f"share:{run_dir.name}")
+        return real_share(run_dir, **kwargs)
+
+    monkeypatch.setattr(cx, "derive", tracking_derive)
+    monkeypatch.setattr(cx, "share", tracking_share)
+
+    async def scenario() -> int:
+        task = asyncio.create_task(cx.record("fake", profile, "vehicle", tmp_path, True))
+        await asyncio.wait_for(watched.wait(), 5.0)
+        task.cancel()
+        return await task
+
+    result = asyncio.run(scenario())
+    assert result == 130
+    assert len(calls) == 2
+    run_dir_name = next(tmp_path.glob("record_*_vehicle")).name
+    assert calls == [f"derive:{run_dir_name}", f"share:{run_dir_name}"]
+
+    run_dir = next(tmp_path.glob("record_*_vehicle"))
+    assert (run_dir / "report.md").exists()

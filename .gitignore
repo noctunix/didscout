@@ -1,5 +1,7 @@
 logs/
 *.jsonl
+*.jsonl.gz
+!captures/*.share.jsonl.gz
 .venv/
 __pycache__/
 .mypy_cache/

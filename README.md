@@ -50,10 +50,10 @@ uv run python didscout.py scan
 ### `probe`
 
 Run a fixed set of allow-listed stages (A-E) against one adapter, logging every
-exchange:
+exchange. Stage E - vehicle-specific module/DID reads - needs a vehicle profile:
 
 ```
-uv run python didscout.py probe <ADDRESS> --stages ABCE --state ignitionOn
+uv run python didscout.py probe <ADDRESS> --stages ABCE --state ignitionOn --profile vag-ppe
 ```
 
 ### `sweep`
@@ -100,28 +100,35 @@ uv run python didscout.py identify <ADDRESS> --state stationary
 ### `session`
 
 One continuous log for a whole outing: a full one-shot pass, then indefinite
-polling of a watch list until Ctrl-C:
+polling of each profile DID marked `watch` until Ctrl-C. Without `--profile`,
+stage E and the watch loop are skipped - only the adapter/protocol/mode-01 parts
+run:
 
 ```
-uv run python didscout.py session <ADDRESS> --state chargingDrive
+uv run python didscout.py session <ADDRESS> --state chargingDrive --profile vag-ppe
 ```
 
-Add `--survey` to also poll `GATEWAY_SURVEY` - gateway DIDs that answered positively
-during earlier sweeps but aren't in `WATCH_PLAN` yet - at `--survey-interval` seconds
-(default 60, minimum 15), logged with stage `E-survey`:
+Add `--survey` to also poll each DID marked `survey` - module DIDs that answered
+positively during discovery but aren't `watch`-worthy yet - at `--survey-interval`
+seconds (default 60, minimum 15), logged with stage `E-survey`:
 
 ```
-uv run python didscout.py session <ADDRESS> --state chargingDrive --survey --survey-interval 30
+uv run python didscout.py session <ADDRESS> --state chargingDrive --profile vag-ppe --survey --survey-interval 30
 ```
 
 During `probe` and `session`, anything you type on stdin (e.g. a display reading)
 is captured as a timestamped note and lands in the same log next to the polled
 exchanges.
 
-The current built-in candidate header/DID set used by `probe`'s and `session`'s
-stage E targets VAG PPE-platform vehicles specifically (gateway `710`/`77A`, tyre
-module `70B`/`775`). Vehicle-specific candidate sets (profiles) for other
-platforms are planned but not implemented yet.
+### Vehicle profiles
+
+`--profile` takes either an id resolved against `profiles/<id>.toml`, or a path to
+a profile file. A profile is a candidate header/DID list for one platform - see
+`profiles/vag-ppe.toml` for VAG's PPE platform (gateway `710`/`77A`, tyre module
+`70B`/`775`). Profiles are data only: they name addresses and DIDs, never
+commands, and everything built from one still goes through the same read-only
+allow-list validation as `sweep`. See `CONTRIBUTING.md` to add a profile for
+another platform.
 
 ## Status meanings
 

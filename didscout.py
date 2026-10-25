@@ -91,10 +91,32 @@ WATCH_PLAN: dict[str, float] = {
 # one of them being worth a dedicated interval yet.
 GATEWAY_SURVEY = [
     f"22{did}"
-    for did in (
-        "2A04 2A15 2A26 2A27 2A28 2A29 2A2D 2A2F 2A31 2A3C 2A50 2A52 2A53 2A65 2A67 "
-        "2AB3 2AB4 2AB5 2AB7 2AB9 2AC1 2AF5 2AF6 2AF8"
-    ).split()
+    for did in [
+        "2A04",
+        "2A15",
+        "2A26",
+        "2A27",
+        "2A28",
+        "2A29",
+        "2A2D",
+        "2A2F",
+        "2A31",
+        "2A3C",
+        "2A50",
+        "2A52",
+        "2A53",
+        "2A65",
+        "2A67",
+        "2AB3",
+        "2AB4",
+        "2AB5",
+        "2AB7",
+        "2AB9",
+        "2AC1",
+        "2AF5",
+        "2AF6",
+        "2AF8",
+    ]
 ]
 # `session`'s one-shot neighbourhood sweeps around the signals already confirmed OK,
 # run once at the start (710) and once at the end after driving (70B) - see `sweep`.
@@ -207,13 +229,7 @@ def _obduds_transport_allowed(cmd: str) -> bool:
         return True
     if cmd == f"ATSH{OBDUDS_FUNCTIONAL_HEADER}" or cmd == f"22{OBDUDS_PROTOCOL_DID:04X}":
         return True
-    if re.fullmatch(r"ATSH18DA[0-9A-F]{2}F1", cmd):
-        return True
-    if re.fullmatch(r"ATCRA18DAF1[0-9A-F]{2}", cmd):
-        return True
-    if re.fullmatch(r"ATFCSH18DA[0-9A-F]{2}F1", cmd):
-        return True
-    return False
+    return bool(re.fullmatch(r"AT(SH|FCSH)18DA[0-9A-F]{2}F1|ATCRA18DAF1[0-9A-F]{2}", cmd))
 
 
 def check_obduds_allowed(command: str) -> str:

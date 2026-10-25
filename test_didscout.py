@@ -180,9 +180,7 @@ def test_sweep_header_argument_derives_protocol_and_rax(
         protocol: str | None,
         obduds_ecus: bool = False,
     ) -> int:
-        captured.update(
-            header=header, rax=rax, protocol=protocol, obduds_ecus=obduds_ecus
-        )
+        captured.update(header=header, rax=rax, protocol=protocol, obduds_ecus=obduds_ecus)
         return 0
 
     monkeypatch.setattr(cx, "sweep", fake_sweep)
@@ -197,28 +195,34 @@ def test_sweep_header_argument_derives_protocol_and_rax(
     }
 
     captured.clear()
-    assert cx.main(
-        [
-            "sweep",
-            "fake",
-            "--header",
-            "18da10f1",
-            "--rax",
-            "18daf1aa",
-            "--start",
-            "2A00",
-            "--end",
-            "2A01",
-            "--state",
-            "x",
-        ]
-    ) == 0
+    assert (
+        cx.main(
+            [
+                "sweep",
+                "fake",
+                "--header",
+                "18da10f1",
+                "--rax",
+                "18daf1aa",
+                "--start",
+                "2A00",
+                "--end",
+                "2A01",
+                "--state",
+                "x",
+            ]
+        )
+        == 0
+    )
     assert captured["rax"] == "18DAF1AA"
 
     captured.clear()
-    assert cx.main(
-        ["sweep", "fake", "--header", "710", "--start", "2A00", "--end", "2A01", "--state", "x"]
-    ) == 0
+    assert (
+        cx.main(
+            ["sweep", "fake", "--header", "710", "--start", "2A00", "--end", "2A01", "--state", "x"]
+        )
+        == 0
+    )
     assert captured == {"header": "710", "rax": None, "protocol": None, "obduds_ecus": False}
 
 

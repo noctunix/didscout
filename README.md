@@ -79,6 +79,14 @@ polling of a watch list until Ctrl-C:
 uv run python didscout.py session <ADDRESS> --state chargingDrive
 ```
 
+Add `--survey` to also poll `GATEWAY_SURVEY` - gateway DIDs that answered positively
+during earlier sweeps but aren't in `WATCH_PLAN` yet - at `--survey-interval` seconds
+(default 60, minimum 15), logged with stage `E-survey`:
+
+```
+uv run python didscout.py session <ADDRESS> --state chargingDrive --survey --survey-interval 30
+```
+
 During `probe` and `session`, anything you type on stdin (e.g. a display reading)
 is captured as a timestamped note and lands in the same log next to the polled
 exchanges.

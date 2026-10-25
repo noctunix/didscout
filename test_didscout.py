@@ -68,6 +68,34 @@ def test_live_value_age_and_summary() -> None:
     assert cx.format_live_summary({}) == "live: -"
 
 
+def test_gateway_survey_commands_are_allowed() -> None:
+    for cmd in cx.GATEWAY_SURVEY:
+        assert cx.check_allowed(cmd) == cmd
+        assert cmd in cx.ALLOWED
+
+
+def test_survey_interval_rejects_below_minimum() -> None:
+    with pytest.raises(SystemExit):
+        cx.main(["session", "fake", "--state", "x", "--survey-interval", "10"])
+
+
+def test_watch_schedule_includes_survey_only_when_enabled() -> None:
+    without = cx.watch_schedule(False, 30.0)
+    assert set(without) == set(cx.WATCH_PLAN)
+
+    with_survey = cx.watch_schedule(True, 30.0)
+    assert set(with_survey) == set(cx.WATCH_PLAN) | set(cx.GATEWAY_SURVEY)
+    assert all(with_survey[cmd] == 30.0 for cmd in cx.GATEWAY_SURVEY)
+    assert all(with_survey[cmd] == cx.WATCH_PLAN[cmd] for cmd in cx.WATCH_PLAN)
+
+
+def test_due_commands_is_a_pure_threshold_filter() -> None:
+    next_due = {"a": 10.0, "b": 20.0, "c": 20.0}
+    assert cx._due_commands(next_due, 15.0) == ["a"]
+    assert sorted(cx._due_commands(next_due, 20.0)) == ["a", "b", "c"]
+    assert cx._due_commands(next_due, 5.0) == []
+
+
 def test_sweep_allows_any_header_read_did() -> None:
     assert cx.check_sweep_allowed("222AB9") == "222AB9"
     assert cx.check_sweep_allowed("ATSH715") == "ATSH715"

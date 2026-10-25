@@ -85,6 +85,17 @@ WATCH_PLAN: dict[str, float] = {
     "222AB8": 15.0,  # HV energy
     "222AB6": 60.0,  # range remaining, coarser display granularity
 }
+# Gateway (710/77A) DIDs that answered positively during earlier sweeps but aren't
+# in WATCH_PLAN yet - `session --survey` polls these at a single, coarser interval
+# alongside WATCH_PLAN so they get logged over a whole outing without committing to
+# one of them being worth a dedicated interval yet.
+GATEWAY_SURVEY = [
+    f"22{did}"
+    for did in (
+        "2A04 2A15 2A26 2A27 2A28 2A29 2A2D 2A2F 2A31 2A3C 2A50 2A52 2A53 2A65 2A67 "
+        "2AB3 2AB4 2AB5 2AB7 2AB9 2AC1 2AF5 2AF6 2AF8"
+    ).split()
+]
 # `session`'s one-shot neighbourhood sweeps around the signals already confirmed OK,
 # run once at the start (710) and once at the end after driving (70B) - see `sweep`.
 SESSION_SWEEP_RANGES: dict[str, tuple[int, int]] = {
@@ -109,6 +120,7 @@ ALLOWED = (
     frozenset(cmd for cmds in STAGES.values() for cmd in cmds)
     | frozenset(STAGE_C_CANDIDATES.values())
     | frozenset(FORCE_PROTOCOL.values())
+    | frozenset(GATEWAY_SURVEY)
 )
 
 # Upper bound on a single `sweep` run, ~15 min at the ~130-220 ms/DID seen so far;
@@ -442,6 +454,19 @@ def format_live_summary(latest: dict[str, LiveValue]) -> str:
     now = time.monotonic()
     parts = [f"{cmd}={v.status}(+{v.age_seconds(now):.0f}s)" for cmd, v in sorted(latest.items())]
     return "live: " + (" ".join(parts) if parts else "-")
+
+
+def watch_schedule(survey: bool, survey_interval: float) -> dict[str, float]:
+    """The combined per-command poll intervals for `session`'s watch loop: WATCH_PLAN
+    always, plus GATEWAY_SURVEY at a single interval when `--survey` is enabled."""
+    plan = dict(WATCH_PLAN)
+    if survey:
+        plan.update(dict.fromkeys(GATEWAY_SURVEY, survey_interval))
+    return plan
+
+
+def _due_commands(next_due: dict[str, float], now: float) -> list[str]:
+    return [cmd for cmd, t in next_due.items() if t <= now]
 
 
 class ElmSession:
@@ -873,6 +898,8 @@ async def run_session(
     out_dir: Path,
     pair: bool,
     protocol: str | None,
+    survey: bool = False,
+    survey_interval: float = 60.0,
 ) -> int:
     """One continuous log for a whole outing (ignition on -> driving -> charging ->
     driving home): a single thorough pass (adapter, protocol, legislative OBD, gateway +
@@ -961,20 +988,21 @@ async def run_session(
             )
             print()
 
+            intervals = watch_schedule(survey, survey_interval)
             latest: dict[str, LiveValue] = {}
-            next_due = dict.fromkeys(WATCH_PLAN, time.monotonic())
+            next_due = dict.fromkeys(intervals, time.monotonic())
             try:
                 while True:
                     now = time.monotonic()
-                    due = [cmd for cmd, t in next_due.items() if t <= now]
+                    due = _due_commands(next_due, now)
                     if not due:
                         await asyncio.sleep(min(1.0, min(next_due.values()) - now))
                         continue
                     for cmd in due:
                         ex = await session.run(cmd)
-                        record(ex, "E-watch")
+                        record(ex, "E-survey" if cmd in GATEWAY_SURVEY else "E-watch")
                         latest[cmd] = LiveValue(ex.response, ex.status, time.monotonic())
-                        next_due[cmd] = time.monotonic() + WATCH_PLAN[cmd]
+                        next_due[cmd] = time.monotonic() + intervals[cmd]
                     print(format_live_summary(latest))
             except asyncio.CancelledError:
                 cancelled = True
@@ -1109,6 +1137,17 @@ def main(argv: list[str]) -> int:
         choices=sorted(FORCE_PROTOCOL),
         help="force CAN protocol instead of ATSP0 auto-detect: 6 = 11-bit/500k, 7 = 29-bit/500k",
     )
+    n.add_argument(
+        "--survey",
+        action="store_true",
+        help="also poll GATEWAY_SURVEY (710/77A DIDs not yet in WATCH_PLAN) at --survey-interval",
+    )
+    n.add_argument(
+        "--survey-interval",
+        type=float,
+        default=60.0,
+        help="poll interval in seconds for --survey (default 60, minimum 15)",
+    )
     args = parser.parse_args(argv)
 
     if args.mode == "scan":
@@ -1134,7 +1173,19 @@ def main(argv: list[str]) -> int:
             )
         )
     if args.mode == "session":
-        return asyncio.run(run_session(args.address, label, args.out, args.pair, args.protocol))
+        if args.survey_interval < 15:
+            parser.error("--survey-interval must be >= 15 seconds")
+        return asyncio.run(
+            run_session(
+                args.address,
+                label,
+                args.out,
+                args.pair,
+                args.protocol,
+                args.survey,
+                args.survey_interval,
+            )
+        )
     stages = args.stages.upper()
     if not stages or any(st not in STAGES for st in stages):
         parser.error("--stages must only contain A-E")

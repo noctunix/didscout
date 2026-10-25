@@ -1815,7 +1815,7 @@ def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_
 
     state = cx.RunState.new("vehicle", "fake")
     state.set_result("protocol", {"answered": ["6"], "chosen": "6"})
-    state.set_result("mode01", {"supported_pids": ["0D"]})
+    state.set_result("mode01", {"supported_pids": ["0D"], "protocol": "6"})
     state.set_result("ecus11", {"710": {"response": "77A", "identify": {}}})
     state.set_result("obduds", {})
     state_path = tmp_path / "state.json"
@@ -1870,3 +1870,118 @@ def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_
 
     asyncio.run(scenario())
     assert state.finished is False
+
+
+def test_mode01_protocol_is_whichever_answered_mode01_not_the_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sent: list[str] = []
+
+    def responder(cmd: str) -> bytes:
+        sent.append(cmd)
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    async def scenario() -> cx.RunState:
+        state = cx.RunState.new("vehicle", "fake")
+        # A profile pinned to protocol 6, but only 7 actually answered mode 01
+        # in the `protocol` stage - mode 01 must still end up on 7.
+        state.set_result("protocol", {"answered": ["7"], "chosen": "6"})
+        async with cx.connect_adapter("fake", False, tmp_path / "mode01.jsonl", "vehicle") as link:
+            assert link is not None
+            await cx._inventory_mode01(link, state, None)
+        return state
+
+    state = asyncio.run(scenario())
+    mode01 = state.result("mode01")
+    assert isinstance(mode01, dict)
+    assert mode01["protocol"] == "7"
+    assert "ATSP7" in sent
+    assert "ATSP6" not in sent
+
+
+def test_check_mode01_watch_allowed_accepts_both_protocol_switches() -> None:
+    assert cx.check_mode01_watch_allowed("ATSP6") == "ATSP6"
+    assert cx.check_mode01_watch_allowed("ATSP7") == "ATSP7"
+
+
+def test_record_loop_switches_protocol_between_modules_without_redundant_atsp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "DISCOVERY_PRIORITY_RANGES", ())
+    monkeypatch.setattr(cx, "DISCOVERY_FULL_RANGE", (0x1000, 0x1003))
+    monkeypatch.setattr(cx, "RECORD_DISCOVERY_BATCH", 2)
+
+    fake_protocol = {"value": "6"}
+    atsp_sent: list[str] = []
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd == "ATZ":
+            return b"ELM327 v1.4\r>"
+        if cmd in ("ATSP6", "ATSP7"):
+            atsp_sent.append(cmd)
+            fake_protocol["value"] = cmd[-1]
+            return b"OK\r>"
+        if cmd.startswith("ATSH"):
+            header = cmd[4:]
+            # A strict vehicle: an 8-digit (29-bit) header only answers under
+            # protocol 7, a 3-digit (11-bit) one only under protocol 6.
+            if len(header) == 8 and fake_protocol["value"] != "7":
+                return b"?\r>"
+            if len(header) == 3 and fake_protocol["value"] != "6":
+                return b"?\r>"
+            return b"OK\r>"
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if cmd == "22F40D":
+            return hex_reply("18DAF1A0", bytes([0x62, 0xF4, 0x0D, 0x00]))
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": ["6", "7"], "chosen": "6"})
+    state.set_result("mode01", {"supported_pids": [], "protocol": None})
+    state.set_result(
+        "ecus11",
+        {
+            "710": {"response": "77A", "identify": {}},
+            "705": {"response": "77B", "identify": {}},
+        },
+    )
+    state.set_result(
+        "obduds", {"18DAF1A0": {"response": "18DAF1A0", "supported_dids": ["F40D"], "identify": {}}}
+    )
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            loop_state = cx.build_record_loop_state(None, state)
+
+            # tick1: the speed source (obduds, protocol 7) - first switch ever,
+            # so it's unconditional (current protocol starts unknown).
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            # tick2: discovery moves to ecus11:710 (protocol 6) - switches.
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            # tick3: still ecus11:710 (same module) - no setup, no ATSP at all.
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            # tick4: ecus11:705 - a different module, but still protocol 6 -
+            # setup is resent (new header/filter), the protocol switch is not.
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            # tick5: still ecus11:705 - no setup, no ATSP.
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            # tick6: discovery moves to the obduds module (protocol 7) again.
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+
+    asyncio.run(scenario())
+
+    assert atsp_sent == ["ATSP7", "ATSP6", "ATSP7"]

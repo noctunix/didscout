@@ -16,6 +16,19 @@ import pytest
 
 import didscout as cx
 
+
+class _IdleNoteReader:
+    async def stop(self) -> None:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _no_stdin_note_reader(monkeypatch: pytest.MonkeyPatch) -> None:
+    # pytest captures stdin, so a real reader thread would die on its first read;
+    # tests that exercise notes patch start_note_reader themselves.
+    monkeypatch.setattr(cx, "start_note_reader", lambda _record: _IdleNoteReader())
+
+
 FORBIDDEN_PREFIXES = (
     "04",
     "14",

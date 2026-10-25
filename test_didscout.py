@@ -1313,3 +1313,368 @@ def test_probe_logs_failure_and_disconnects_without_next_command(
             "rejected_header": "?",
         }[failure]
     )
+
+
+# --- record mode -------------------------------------------------------------
+
+
+def test_check_mode01_allowed_is_read_only_current_data() -> None:
+    allowed = ("ATZ", "ATSP6", "0100", "010D", "01FF")
+    assert [cx.check_mode01_allowed(cmd) for cmd in allowed] == list(allowed)
+    for cmd in ("22F18C", "22F190", "22F802", "14FFFF", "2E2AB800"):
+        with pytest.raises(cx.ForbiddenCommandError):
+            cx.check_mode01_allowed(cmd)
+
+
+def test_check_ecus11_allowed_is_read_only_and_four_dids_only() -> None:
+    allowed = (
+        "ATSP6",
+        "ATCF700",
+        "ATCM700",
+        "ATAR",
+        "ATSH710",
+        "ATCRA77A",
+        "ATFCSH710",
+        "22F187",
+        "22F189",
+        "22F191",
+        "22F197",
+    )
+    assert [cx.check_ecus11_allowed(cmd) for cmd in allowed] == list(allowed)
+    for cmd in ("22F18C", "22F190", "22F802", "22F400", "14FFFF33", "2EF44900"):
+        with pytest.raises(cx.ForbiddenCommandError):
+            cx.check_ecus11_allowed(cmd)
+
+
+def test_run_state_round_trip_and_atomic_write(tmp_path: Path) -> None:
+    state = cx.RunState.new("vehicle", "AA:BB:CC:DD:EE:FF")
+    state.mark_stage("adapter", "done")
+    state.set_result("adapter", {"ATI": "ELM327 v1.4"})
+    path = tmp_path / "state.json"
+    state.save(path)
+
+    assert path.exists()
+    assert not path.with_name("state.json.tmp").exists()
+
+    loaded = cx.RunState.load(path)
+    assert loaded.label == "vehicle"
+    assert loaded.address == "AA:BB:CC:DD:EE:FF"
+    assert loaded.stage_status("adapter") == "done"
+    assert loaded.result("adapter") == {"ATI": "ELM327 v1.4"}
+    assert loaded.finished is False
+
+
+def _write_run(out_dir: Path, stamp: str, label: str, *, finished: bool) -> Path:
+    run_dir = out_dir / f"record_{stamp}_{label}"
+    run_dir.mkdir(parents=True)
+    state = cx.RunState.new(label, "AA:BB")
+    if finished:
+        state.mark_finished()
+    state.save(run_dir / "state.json")
+    return run_dir
+
+
+def test_find_resumable_run_picks_newest_unfinished_same_label(tmp_path: Path) -> None:
+    _write_run(tmp_path, "20260101_000000", "vehicle", finished=False)
+    newest = _write_run(tmp_path, "20260102_000000", "vehicle", finished=False)
+    _write_run(tmp_path, "20260103_000000", "vehicle", finished=True)
+    _write_run(tmp_path, "20260104_000000", "other", finished=False)
+
+    assert cx.find_resumable_run(tmp_path, "vehicle") == newest
+    assert cx.find_resumable_run(tmp_path, "nonexistent-label") is None
+    assert cx.find_resumable_run(tmp_path / "missing", "vehicle") is None
+
+
+def test_find_adapter_address_picks_strongest_rssi(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeDevice:
+        def __init__(self, address: str) -> None:
+            self.address = address
+
+    class FakeAdv:
+        def __init__(self, rssi: int, uuids: list[str]) -> None:
+            self.rssi = rssi
+            self.service_uuids = uuids
+
+    class FakeScanner:
+        @staticmethod
+        async def discover(timeout: float, return_adv: bool) -> dict[str, object]:
+            return {
+                "AA": (FakeDevice("AA"), FakeAdv(-80, [cx.UART_SERVICE])),
+                "BB": (FakeDevice("BB"), FakeAdv(-40, [cx.UART_SERVICE])),
+                "CC": (FakeDevice("CC"), FakeAdv(-30, ["0000ffff-0000-1000-8000-00805f9b34fb"])),
+            }
+
+    monkeypatch.setattr(bleak, "BleakScanner", FakeScanner)
+    assert asyncio.run(cx.find_adapter_address(seconds=0.01)) == "BB"
+
+
+def test_find_adapter_address_rescans_until_device_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"n": 0}
+
+    class FakeDevice:
+        def __init__(self, address: str) -> None:
+            self.address = address
+
+    class FakeAdv:
+        def __init__(self, rssi: int, uuids: list[str]) -> None:
+            self.rssi = rssi
+            self.service_uuids = uuids
+
+    class FakeScanner:
+        @staticmethod
+        async def discover(timeout: float, return_adv: bool) -> dict[str, object]:
+            calls["n"] += 1
+            if calls["n"] < 2:
+                return {}
+            return {"AA": (FakeDevice("AA"), FakeAdv(-50, [cx.UART_SERVICE]))}
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(bleak, "BleakScanner", FakeScanner)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    address = asyncio.run(cx.find_adapter_address(seconds=0.01, rescan_interval=10.0))
+    assert address == "AA"
+    assert sleeps == [10.0]
+
+
+def _ok_responder(cmd: str) -> bytes:
+    """A stand-in adapter that answers ATZ with a recognized banner and every
+    other AT command with OK - enough to clear ADAPTER_SETUP in `record` tests
+    that stub out the inventory stages themselves."""
+    if cmd == "ATZ":
+        return b"ELM327 v1.4\r>"
+    return b"OK\r>"
+
+
+def _fake_record_client(responder: Callable[[str], bytes]) -> type:
+    class FakeCharacteristic:
+        properties = ["write-without-response"]
+
+    class FakeServices:
+        def get_characteristic(self, _uuid: str) -> FakeCharacteristic:
+            return FakeCharacteristic()
+
+    class FakeClient:
+        mtu_size = 23
+        services = FakeServices()
+
+        def __init__(self, _address: str, *, timeout: float) -> None:
+            self.callback: Callable[[object, bytes], None] | None = None
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: TracebackType | None,
+        ) -> None:
+            pass
+
+        async def pair(self) -> None:
+            pass
+
+        async def start_notify(self, _uuid: str, callback: Callable[[object, bytes], None]) -> None:
+            self.callback = callback
+
+        async def stop_notify(self, _uuid: str) -> None:
+            pass
+
+        async def write_gatt_char(
+            self, _characteristic: FakeCharacteristic, data: bytes, *, response: bool
+        ) -> None:
+            cmd = data.decode().strip()
+            reply = responder(cmd)
+            assert self.callback is not None
+            self.callback(None, reply)
+
+    return FakeClient
+
+
+def test_record_resumes_unfinished_run_and_new_flag_starts_fresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+
+    def make_stage(name: str) -> Callable[[object, cx.RunState, object], object]:
+        async def stage(_link: object, state: cx.RunState, _profile: object) -> None:
+            calls.append(name)
+            state.set_result(name, {})
+
+        return stage
+
+    fakes = {name: make_stage(name) for name in cx.INVENTORY_STAGE_ORDER}
+    monkeypatch.setattr(cx, "INVENTORY_STAGE_FUNCS", fakes)
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    existing = _write_run(tmp_path, "20260101_000000", "vehicle", finished=False)
+    state = cx.RunState.load(existing / "state.json")
+    state.mark_stage("adapter", "done")
+    state.save(existing / "state.json")
+
+    result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False))
+    assert result == 0
+    assert calls == ["protocol", "mode01", "obduds", "ecus11"]
+    assert cx.RunState.load(existing / "state.json").finished is True
+
+    calls.clear()
+    result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, True))
+    assert result == 0
+    assert calls == list(cx.INVENTORY_STAGE_ORDER)
+    assert len(list(tmp_path.glob("record_*"))) == 2
+
+
+def test_record_reconnects_after_transport_error_and_resumes_interrupted_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_INITIAL_BACKOFF", 0.0)
+    monkeypatch.setattr(cx, "RECORD_MAX_BACKOFF", 0.0)
+
+    calls: list[str] = []
+    protocol_attempts = {"n": 0}
+
+    async def fake_adapter(_link: object, state: cx.RunState, _profile: object) -> None:
+        calls.append("adapter")
+        state.set_result("adapter", {})
+
+    async def fake_protocol(_link: object, state: cx.RunState, _profile: object) -> None:
+        calls.append("protocol")
+        protocol_attempts["n"] += 1
+        if protocol_attempts["n"] == 1:
+            raise cx.ProbeAbortedError("synthetic transport error")
+        state.set_result("protocol", {"answered": [], "chosen": None})
+
+    async def fake_mode01(_link: object, state: cx.RunState, _profile: object) -> None:
+        calls.append("mode01")
+        state.set_result("mode01", {"supported_pids": []})
+
+    async def fake_obduds(_link: object, state: cx.RunState, _profile: object) -> None:
+        calls.append("obduds")
+        state.set_result("obduds", {})
+
+    async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
+        calls.append("ecus11")
+        state.set_result("ecus11", {})
+
+    monkeypatch.setattr(
+        cx,
+        "INVENTORY_STAGE_FUNCS",
+        {
+            "adapter": fake_adapter,
+            "protocol": fake_protocol,
+            "mode01": fake_mode01,
+            "obduds": fake_obduds,
+            "ecus11": fake_ecus11,
+        },
+    )
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False))
+
+    assert result == 0
+    # adapter must not be redone on the reconnect - only the interrupted stage is retried.
+    assert calls == ["adapter", "protocol", "protocol", "mode01", "obduds", "ecus11"]
+
+    run_dir = next(tmp_path.glob("record_*"))
+    entries = [json.loads(line) for line in (run_dir / "capture.jsonl").read_text().splitlines()]
+    statuses = [entry["status"] for entry in entries if entry["stage"] == "connection"]
+    assert statuses.count("CONNECTED") == 2
+    assert "DISCONNECTED" in statuses
+    assert "RECONNECTING" in statuses
+    assert all(entry.get("mode") == "record" for entry in entries)
+
+
+def test_record_marks_stage_failed_after_three_consecutive_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_INITIAL_BACKOFF", 0.0)
+    monkeypatch.setattr(cx, "RECORD_MAX_BACKOFF", 0.0)
+
+    attempts = {"n": 0}
+
+    async def fake_adapter(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("adapter", {})
+
+    async def failing_protocol(_link: object, _state: cx.RunState, _profile: object) -> None:
+        attempts["n"] += 1
+        raise cx.ProbeAbortedError("synthetic rejection")
+
+    async def fake_mode01(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("mode01", {"supported_pids": []})
+
+    async def fake_obduds(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("obduds", {})
+
+    async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus11", {})
+
+    monkeypatch.setattr(
+        cx,
+        "INVENTORY_STAGE_FUNCS",
+        {
+            "adapter": fake_adapter,
+            "protocol": failing_protocol,
+            "mode01": fake_mode01,
+            "obduds": fake_obduds,
+            "ecus11": fake_ecus11,
+        },
+    )
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False))
+
+    assert result == 0
+    assert attempts["n"] == 3
+    run_dir = next(tmp_path.glob("record_*"))
+    state = cx.RunState.load(run_dir / "state.json")
+    assert state.stage_status("protocol") == "failed"
+    assert state.stage_status("mode01") == "done"
+    assert state.finished is True
+
+
+def test_ecus11_discovery_finds_positive_and_negative_responders_and_ignores_silence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    current_header = {"value": None}
+    replies = {
+        ("710", "22F189"): b"77A0462F18901\r>",
+        ("710", "22F187"): b"77A0462F18701\r>",
+        ("710", "22F191"): b"77A0462F19101\r>",
+        ("710", "22F197"): b"77A0762F19745435531\r>",
+        ("705", "22F189"): b"745037F2231\r>",
+        ("705", "22F187"): b"745037F2231\r>",
+        ("705", "22F191"): b"745037F2231\r>",
+        ("705", "22F197"): b"745037F2231\r>",
+    }
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("ATSH"):
+            current_header["value"] = cmd[4:]
+            return b"OK\r>"
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        return replies.get((current_header["value"], cmd), b"NO DATA\r>")
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    async def scenario() -> cx.RunState:
+        state = cx.RunState.new("vehicle", "fake")
+        async with cx.connect_adapter("fake", False, tmp_path / "ecus11.jsonl", "vehicle") as link:
+            assert link is not None
+            await cx._inventory_ecus11(link, state, None)
+        return state
+
+    state = asyncio.run(scenario())
+    ecus = state.result("ecus11")
+    assert isinstance(ecus, dict)
+    assert set(ecus) == {"710", "705"}
+    assert ecus["710"]["response"] == "77A"
+    assert ecus["710"]["identify"]["F189"] == "OK"
+    assert ecus["705"]["response"] == "745"
+    assert ecus["705"]["identify"]["F189"].startswith("NRC")

@@ -55,12 +55,6 @@ def test_note_exchange_is_timestamped_and_not_sent() -> None:
     assert ex.started_utc  # non-empty ISO timestamp, no BLE round trip needed for this
 
 
-def test_watch_plan_commands_are_allowed_and_known_ok() -> None:
-    for cmd in cx.WATCH_PLAN:
-        assert cmd in cx.ALLOWED
-        assert cmd in cx.STAGE_E_GATEWAY
-
-
 def test_live_value_age_and_summary() -> None:
     v = cx.LiveValue("622AB8...", "OK", time.monotonic() - 5)
     assert 4.5 < v.age_seconds() < 5.5
@@ -68,25 +62,9 @@ def test_live_value_age_and_summary() -> None:
     assert cx.format_live_summary({}) == "live: -"
 
 
-def test_gateway_survey_commands_are_allowed() -> None:
-    for cmd in cx.GATEWAY_SURVEY:
-        assert cx.check_allowed(cmd) == cmd
-        assert cmd in cx.ALLOWED
-
-
 def test_survey_interval_rejects_below_minimum() -> None:
     with pytest.raises(SystemExit):
         cx.main(["session", "fake", "--state", "x", "--survey-interval", "10"])
-
-
-def test_watch_schedule_includes_survey_only_when_enabled() -> None:
-    without = cx.watch_schedule(False, 30.0)
-    assert set(without) == set(cx.WATCH_PLAN)
-
-    with_survey = cx.watch_schedule(True, 30.0)
-    assert set(with_survey) == set(cx.WATCH_PLAN) | set(cx.GATEWAY_SURVEY)
-    assert all(with_survey[cmd] == 30.0 for cmd in cx.GATEWAY_SURVEY)
-    assert all(with_survey[cmd] == cx.WATCH_PLAN[cmd] for cmd in cx.WATCH_PLAN)
 
 
 def test_due_commands_is_a_pure_threshold_filter() -> None:
@@ -161,6 +139,314 @@ def test_identify_allowlist_is_read_only_and_four_dids_only() -> None:
     for cmd in ("22F18C", "22F190", "22F802", "22F400", "22F5FF", "14FFFF33", "2EF44900"):
         with pytest.raises(cx.ForbiddenCommandError):
             cx.check_identify_allowed(cmd)
+
+
+PROFILE_FILES = sorted((Path(__file__).parent / "profiles").glob("*.toml"))
+
+
+@pytest.mark.parametrize("path", PROFILE_FILES, ids=[p.stem for p in PROFILE_FILES])
+def test_shipped_profile_loads_and_only_ever_yields_sweep_allowed_commands(path: Path) -> None:
+    """Loads every profile shipped in `profiles/` - this is what makes a broken or
+    unsafe profile PR fail the test suite automatically."""
+    profile = cx.load_profile(path)
+    assert profile.id == path.stem
+    for module in profile.modules:
+        for cmd in cx.module_setup_commands(module):
+            cx.check_sweep_allowed(cmd)
+        for did in module.dids:
+            cx.check_sweep_allowed(f"22{did.did}")
+
+
+VALID_PROFILE_TOML = """
+schema = 1
+id = "testprofile"
+name = "Test profile"
+description = "A test profile"
+protocol = "6"
+vehicles = ["Test vehicle"]
+
+[[sources]]
+title = "Test source"
+url = "https://example.com"
+license = "own discovery"
+
+[[modules]]
+id = "mod1"
+request = "710"
+response = "77A"
+
+[[modules.dids]]
+did = "2AB8"
+name = "test did"
+status = "plausible"
+poll = "once"
+"""
+
+
+def _load(tmp_path: Path, text: str, filename: str = "testprofile.toml") -> cx.Profile:
+    path = tmp_path / filename
+    path.write_text(text)
+    return cx.load_profile(path)
+
+
+def test_valid_profile_loads(tmp_path: Path) -> None:
+    profile = _load(tmp_path, VALID_PROFILE_TOML)
+    assert profile.id == "testprofile"
+    assert profile.modules[0].dids[0].did == "2AB8"
+
+
+def test_resolve_profile_finds_by_id_in_profiles_dir() -> None:
+    profile = cx.resolve_profile("vag-ppe")
+    assert profile.id == "vag-ppe"
+
+
+def test_resolve_profile_raises_when_not_found(tmp_path: Path) -> None:
+    with pytest.raises(cx.ProfileError):
+        cx.resolve_profile(str(tmp_path / "does-not-exist"))
+
+
+@pytest.mark.parametrize(
+    ("name", "broken"),
+    [
+        ("invalid_toml_syntax", "not valid toml ["),
+        ("wrong_schema", VALID_PROFILE_TOML.replace("schema = 1", "schema = 2")),
+        (
+            "id_not_matching_pattern",
+            VALID_PROFILE_TOML.replace('id = "testprofile"', 'id = "Test_Profile"'),
+        ),
+        ("unknown_root_key", VALID_PROFILE_TOML.replace("schema = 1", "schema = 1\nextra = 1")),
+        (
+            "missing_required_root_key",
+            VALID_PROFILE_TOML.replace('description = "A test profile"\n', ""),
+        ),
+        ("invalid_protocol", VALID_PROFILE_TOML.replace('protocol = "6"', 'protocol = "8"')),
+        (
+            "empty_vehicles",
+            VALID_PROFILE_TOML.replace('vehicles = ["Test vehicle"]', "vehicles = []"),
+        ),
+        (
+            "unknown_source_key",
+            VALID_PROFILE_TOML.replace(
+                'license = "own discovery"', 'license = "own discovery"\nextra = 1'
+            ),
+        ),
+        (
+            "unknown_module_key",
+            VALID_PROFILE_TOML.replace('response = "77A"', 'response = "77A"\nextra = 1'),
+        ),
+        (
+            "duplicate_module_id",
+            VALID_PROFILE_TOML
+            + """
+            [[modules]]
+            id = "mod1"
+            request = "70B"
+
+            [[modules.dids]]
+            did = "18A0"
+            name = "dup"
+            status = "plausible"
+            poll = "once"
+            """,
+        ),
+        (
+            "module_request_not_a_header",
+            VALID_PROFILE_TOML.replace('request = "710"', 'request = "ZZZZ"'),
+        ),
+        (
+            "module_request_11bit_over_7ff",
+            VALID_PROFILE_TOML.replace('request = "710"', 'request = "800"'),
+        ),
+        (
+            "module_29bit_request_needs_protocol_7",
+            VALID_PROFILE_TOML.replace('request = "710"', 'request = "18DA10F1"'),
+        ),
+        (
+            "module_response_not_a_header",
+            VALID_PROFILE_TOML.replace('response = "77A"', 'response = "ZZZ"'),
+        ),
+        (
+            "did_is_vin",
+            VALID_PROFILE_TOML.replace('did = "2AB8"', 'did = "F190"'),
+        ),
+        (
+            "did_wrong_length",
+            VALID_PROFILE_TOML.replace('did = "2AB8"', 'did = "2AB"'),
+        ),
+        (
+            "did_invalid_status",
+            VALID_PROFILE_TOML.replace('status = "plausible"', 'status = "confirmed"'),
+        ),
+        (
+            "did_invalid_poll",
+            VALID_PROFILE_TOML.replace('poll = "once"', 'poll = "always"'),
+        ),
+        (
+            "once_with_interval",
+            VALID_PROFILE_TOML.replace('poll = "once"', 'poll = "once"\ninterval = 10'),
+        ),
+        (
+            "watch_without_interval",
+            VALID_PROFILE_TOML.replace('poll = "once"', 'poll = "watch"'),
+        ),
+        (
+            "watch_interval_below_minimum",
+            VALID_PROFILE_TOML.replace('poll = "once"', 'poll = "watch"\ninterval = 4'),
+        ),
+        (
+            "name_missing_for_non_survey_poll",
+            VALID_PROFILE_TOML.replace('name = "test did"\n', ""),
+        ),
+        (
+            "discover_start_after_end",
+            VALID_PROFILE_TOML.replace(
+                'response = "77A"', 'response = "77A"\ndiscover = [["2A01", "2A00"]]'
+            ),
+        ),
+        (
+            "vin_like_string_anywhere",
+            VALID_PROFILE_TOML.replace(
+                'description = "A test profile"', 'description = "WVWZZZ1KZAW123456"'
+            ),
+        ),
+    ],
+)
+def test_profile_rejections(tmp_path: Path, name: str, broken: str) -> None:
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, broken)
+
+
+def test_profile_rejects_duplicate_did_in_one_module(tmp_path: Path) -> None:
+    broken = VALID_PROFILE_TOML + """
+    [[modules.dids]]
+    did = "2AB8"
+    name = "dup"
+    status = "plausible"
+    poll = "once"
+    """
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, broken)
+
+
+def test_profile_rejects_discover_range_exceeding_max_sweep_dids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cx, "MAX_SWEEP_DIDS", 1)
+    broken = VALID_PROFILE_TOML.replace(
+        'response = "77A"', 'response = "77A"\ndiscover = [["2A00", "2A01"]]'
+    )
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, broken)
+
+
+def test_profile_allows_survey_did_without_name(tmp_path: Path) -> None:
+    text = VALID_PROFILE_TOML.replace('name = "test did"\n', "").replace(
+        'poll = "once"', 'poll = "survey"\ninterval = 30'
+    )
+    profile = _load(tmp_path, text)
+    assert profile.modules[0].dids[0].name is None
+    assert profile.modules[0].dids[0].poll == "survey"
+
+
+def test_profile_id_must_equal_file_stem(tmp_path: Path) -> None:
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, VALID_PROFILE_TOML, filename="other.toml")
+
+
+def test_module_setup_commands_with_response_use_flow_control() -> None:
+    module = cx.Module(id="m", request="710", response="77A", dids=[])
+    cmds = cx.module_setup_commands(module)
+    assert cmds == ["ATSH710", "ATCRA77A", "ATFCSH710", "ATFCSD300000", "ATFCSM1"]
+    for cmd in cmds:
+        assert cx.check_sweep_allowed(cmd) == cmd
+
+
+def test_module_setup_commands_without_response_are_receive_any() -> None:
+    module = cx.Module(id="m", request="714", response=None, dids=[])
+    cmds = cx.module_setup_commands(module)
+    assert cmds == ["ATFCSM0", "ATAR", "ATSH714"]
+    for cmd in cmds:
+        assert cx.check_sweep_allowed(cmd) == cmd
+
+
+def test_module_setup_commands_for_29bit_header() -> None:
+    module = cx.Module(id="m", request="18DA10F1", response="18DAF110", dids=[])
+    cmds = cx.module_setup_commands(module)
+    assert cmds == [
+        "ATSH18DA10F1",
+        "ATCRA18DAF110",
+        "ATFCSH18DA10F1",
+        "ATFCSD300000",
+        "ATFCSM1",
+    ]
+    for cmd in cmds:
+        assert cx.check_sweep_allowed(cmd) == cmd
+
+
+def test_build_watch_schedule_includes_watch_always_and_survey_when_enabled() -> None:
+    module = cx.Module(
+        id="m",
+        request="710",
+        response="77A",
+        dids=[
+            cx.ModuleDid(did="2AB8", status="plausible", poll="watch", interval=15.0),
+            cx.ModuleDid(did="2AB2", status="unverified", poll="once"),
+            cx.ModuleDid(did="2A04", status="unverified", poll="survey"),
+        ],
+    )
+    without_survey = cx.build_watch_schedule([module], survey=False, survey_interval=30.0)
+    assert [e.command for e in without_survey] == ["222AB8"]
+
+    with_survey = cx.build_watch_schedule([module], survey=True, survey_interval=30.0)
+    assert {e.command: e.interval for e in with_survey} == {"222AB8": 15.0, "222A04": 30.0}
+
+
+def test_watch_loop_resets_up_only_on_module_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    module_a = cx.Module(
+        id="a", request="710", response="77A",
+        dids=[cx.ModuleDid(did="2AB8", status="plausible", poll="watch", interval=5.0)],
+    )
+    module_b = cx.Module(
+        id="b", request="70B", response="775",
+        dids=[cx.ModuleDid(did="18A0", status="plausible", poll="watch", interval=5.0)],
+    )
+    schedule = cx.build_watch_schedule([module_a, module_b], survey=False, survey_interval=0.0)
+
+    calls: list[tuple[str, str]] = []
+    cycles = 0
+
+    async def fake_execute(
+        command: str, stage: str, validator: object = None, responder: str | None = None
+    ) -> cx.Exchange:
+        calls.append((command, stage))
+        return cx.Exchange(command, "NO DATA", "NO DATA", "", 0.0)
+
+    # Run exactly one polling cycle: both modules are due immediately (same
+    # `time.monotonic()` seed), so one pass through the loop must set up module
+    # `a`, read its DID, set up module `b`, read its DID - then stop.
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(_seconds: float) -> None:
+        nonlocal cycles
+        cycles += 1
+        if cycles > 1:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(cx.run_watch_loop(fake_execute, schedule, None, "E-watch", "E-survey"))
+
+    setup_calls = [cmd for cmd, stage in calls if stage == "E-watch-setup"]
+    assert setup_calls == cx.module_setup_commands(module_a) + cx.module_setup_commands(module_b)
+    assert ("222AB8", "E-watch") in calls
+    assert ("2218A0", "E-watch") in calls
+
+
+def test_probe_stage_e_without_profile_is_a_parser_error() -> None:
+    with pytest.raises(SystemExit):
+        cx.main(["probe", "fake", "--state", "x", "--stages", "E"])
 
 
 def test_sweep_header_argument_derives_protocol_and_rax(
@@ -500,6 +786,37 @@ def test_session_ctrl_c_cleans_up_and_returns_130(
     watch_cycle = asyncio.Event()
     ab6_count = 0
 
+    profile_path = tmp_path / "testgw.toml"
+    profile_path.write_text(
+        """
+        schema = 1
+        id = "testgw"
+        name = "Test gateway"
+        description = "Test fixture"
+        protocol = "6"
+        vehicles = ["Test vehicle"]
+
+        [[sources]]
+        title = "Test"
+        url = "https://example.com"
+        license = "own discovery"
+
+        [[modules]]
+        id = "gateway"
+        request = "710"
+        response = "77A"
+        discover = [["2AB6", "2AB6"]]
+
+        [[modules.dids]]
+        did = "2AB6"
+        name = "range remaining"
+        status = "validated"
+        poll = "watch"
+        interval = 60
+        """
+    )
+    profile = cx.load_profile(profile_path)
+
     class FakeCharacteristic:
         properties = ["write-without-response"]
 
@@ -559,7 +876,9 @@ def test_session_ctrl_c_cleans_up_and_returns_130(
             self.callback(None, reply)
 
     async def scenario() -> int:
-        task = asyncio.create_task(cx.run_session("fake", "drive", tmp_path, False, "6"))
+        task = asyncio.create_task(
+            cx.run_session("fake", "drive", tmp_path, False, "6", profile=profile)
+        )
         await asyncio.wait_for(watch_cycle.wait(), 5.0)
         await asyncio.sleep(0)
         task.cancel()
@@ -567,8 +886,6 @@ def test_session_ctrl_c_cleans_up_and_returns_130(
 
     monkeypatch.setattr(bleak, "BleakClient", FakeClient)
     monkeypatch.setattr(cx, "start_note_reader", lambda _record: FakeNoteReader())
-    monkeypatch.setitem(cx.SESSION_SWEEP_RANGES, "710", (0x2AB6, 0x2AB6))
-    monkeypatch.setitem(cx.SESSION_SWEEP_RANGES, "70B", (0x18A0, 0x18A0))
 
     assert asyncio.run(scenario()) == 130
     assert sent[-3:] == ["ATFCSM0", "ATAR", "ATD"]
@@ -825,7 +1142,6 @@ def test_missing_prompt_invalidates_session(monkeypatch: pytest.MonkeyPatch) -> 
         ("0100", "SEARCHING...\r7E806410008000000", "OK"),
         ("222AB8", "77A037F2278", "PENDING"),
         ("222AB8", "77A037F2233\n77A21000000000000", "NRC 33 securityAccessDenied"),
-        ("222AB8", "77505622AB80012", "UNMATCHED"),
         ("222AB8", "77A07622AB8000012", "MALFORMED"),
         ("222AB8", "77A100A622AB8000000\n77A2100000000", "OK"),
         ("222AB8", "77A100A622AB8000000", "MALFORMED"),
@@ -841,6 +1157,14 @@ def test_classification_requires_matching_complete_response(
     command: str, response: str, status: str
 ) -> None:
     assert cx.classify(command, response) == status
+
+
+def test_classify_requires_an_explicit_responder_to_filter_wrong_header() -> None:
+    # classify() no longer guesses a responder from the DID prefix - callers
+    # (profile-driven module reads) must pass it explicitly to filter out a
+    # positive reply that came from the wrong module.
+    assert cx.classify("222AB8", "77505622AB80012") == "OK"
+    assert cx.classify("222AB8", "77505622AB80012", "77A") == "UNMATCHED"
 
 
 @pytest.mark.parametrize("failure", ["blocked", "error", "overflow", "cancel", "trailing"])

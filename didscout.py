@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -37,92 +38,9 @@ STAGES: dict[str, list[str]] = {
     # Stage C is expanded at runtime from the supported-PID bitmaps.
     "C": ["0100", "0120", "0140", "0160", "0180", "01A0"],
     "D": ["ATMA"],
-    "E": [],  # filled below from STAGE_E_GATEWAY + STAGE_E_REST
-}
-# This is one example candidate set, scoped to VAG PPE-platform vehicles - not a
-# universal header/DID list. Other platforms need their own candidate set.
-# Gateway (PPE sibling Macan Electric per OBDb; odometer per OBDb Audi-A6).
-STAGE_E_GATEWAY = [
-    "ATSH710",
-    "ATCRA77A",
-    "ATFCSH710",
-    "ATFCSD300000",
-    "ATFCSM1",
-    "22F189",
-    "222AF7",
-    "222AB8",
-    "222AB2",
-    "222AB6",
-    "222A0A",
-]
-STAGE_E_REST = [
-    # Tyre pressure module.
-    "ATSH70B",
-    "ATCRA775",
-    "ATFCSH70B",
-    "2218A0",
-    "2218A1",
-    "2218A2",
-    "2218A3",
-    "ATFCSM0",
-    "ATAR",
-    # Instrument cluster odometer per OBDb Audi-A6 (hdr 714, DID 2203); response ID
-    # is unknown there, so no ATCRA/flow control — ATAR above already reset receive
-    # filtering to automatic, and a 24-bit odometer fits one single-frame reply.
-    "ATSH714",
-    "222203",
-    "ATD",
-]
-STAGES["E"] = STAGE_E_GATEWAY + STAGE_E_REST
-# Repeated during --watch-seconds, between the gateway reads and the tyre/odometer block,
-# while ATSH710/ATCRA77A are still in effect — every DID confirmed OK there so far, each
-# at its own interval (fast-changing values more often than near-static ones). 22F189 and
-# 222AB2 are already captured once by STAGE_E_GATEWAY above and don't change within a
-# session, so they're deliberately not repeated here. Extend this as more DIDs are
-# confirmed (including sweep hits from `sweep --header 710 ...`).
-WATCH_PLAN: dict[str, float] = {
-    "222AF7": 15.0,  # 12-V bundle: current/SoC move fast while charging
-    "222AB8": 15.0,  # HV energy
-    "222AB6": 60.0,  # range remaining, coarser display granularity
-}
-# Gateway (710/77A) DIDs that answered positively during earlier sweeps but aren't
-# in WATCH_PLAN yet - `session --survey` polls these at a single, coarser interval
-# alongside WATCH_PLAN so they get logged over a whole outing without committing to
-# one of them being worth a dedicated interval yet.
-GATEWAY_SURVEY = [
-    f"22{did}"
-    for did in [
-        "2A04",
-        "2A15",
-        "2A26",
-        "2A27",
-        "2A28",
-        "2A29",
-        "2A2D",
-        "2A2F",
-        "2A31",
-        "2A3C",
-        "2A50",
-        "2A52",
-        "2A53",
-        "2A65",
-        "2A67",
-        "2AB3",
-        "2AB4",
-        "2AB5",
-        "2AB7",
-        "2AB9",
-        "2AC1",
-        "2AF5",
-        "2AF6",
-        "2AF8",
-    ]
-]
-# `session`'s one-shot neighbourhood sweeps around the signals already confirmed OK,
-# run once at the start (710) and once at the end after driving (70B) - see `sweep`.
-SESSION_SWEEP_RANGES: dict[str, tuple[int, int]] = {
-    "710": (0x2A00, 0x2AFF),
-    "70B": (0x1800, 0x18FF),
+    # Stage E has no fixed commands of its own - it is entirely generated at
+    # runtime from a vehicle profile (see `profiles/` and `load_profile`).
+    "E": [],
 }
 STAGE_C_CANDIDATES = {"0D": "010D", "46": "0146", "5B": "015B", "A6": "01A6"}
 # ATSP0 auto-detect can pick the wrong CAN protocol on some vehicles (e.g. settle on
@@ -138,11 +56,18 @@ OBDUDS_FIRST_SUPPORT_DID = 0xF400
 OBDUDS_LAST_SUPPORT_DID = 0xF5C0
 OBDUDS_MAX_DATA_DIDS = 512
 
+# Adapter-control commands used to set up/tear down a profile module's header,
+# response filter, and flow control - contributed to ALLOWED directly since
+# module headers themselves are data (see check_sweep_allowed), not fixed commands.
+MODULE_CONTROL_COMMANDS = frozenset(
+    {"ATFCSD300000", "ATFCSM0", "ATFCSM1", "ATAR", "ATD", "ATSP6", "ATSP7"}
+)
+
 ALLOWED = (
     frozenset(cmd for cmds in STAGES.values() for cmd in cmds)
     | frozenset(STAGE_C_CANDIDATES.values())
     | frozenset(FORCE_PROTOCOL.values())
-    | frozenset(GATEWAY_SURVEY)
+    | MODULE_CONTROL_COMMANDS
 )
 
 # Upper bound on a single `sweep` run, ~15 min at the ~130-220 ms/DID seen so far;
@@ -258,6 +183,387 @@ def check_identify_allowed(command: str) -> str:
     raise ForbiddenCommandError(cmd)
 
 
+PROFILES_DIR = Path(__file__).parent / "profiles"
+PROFILE_ID_PATTERN = re.compile(r"[a-z0-9-]+")
+# Guards against a pasted VIN ending up in a profile (and thus a public PR) by
+# accident - ISO 3779 excludes I, O, Q from the check-digit-bearing positions.
+VIN_LIKE_PATTERN = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
+HEADER_11BIT_PATTERN = re.compile(r"[0-9A-F]{3}")
+HEADER_29BIT_REQUEST_PATTERN = re.compile(r"18DA[0-9A-F]{2}F1")
+HEADER_29BIT_RESPONSE_PATTERN = re.compile(r"18DAF1[0-9A-F]{2}")
+PROFILE_DID_PATTERN = re.compile(r"[0-9A-F]{4}")
+PROFILE_STATUSES = frozenset({"unverified", "plausible", "validated"})
+PROFILE_POLL_MODES = frozenset({"once", "watch", "survey"})
+MIN_PROFILE_INTERVAL = 5.0
+
+
+class ProfileError(Exception):
+    """Raised by `load_profile` for anything wrong with a profile file, naming
+    the file and the offending field so a broken or unsafe PR fails review with
+    a message that points straight at the problem."""
+
+    def __init__(self, path: Path, field: str, message: str) -> None:
+        super().__init__(f"{path.name}: {field}: {message}")
+        self.path = path
+        self.field = field
+
+
+@dataclass
+class ProfileSource:
+    title: str
+    url: str
+    license: str
+
+
+@dataclass
+class ModuleDid:
+    did: str
+    status: str
+    poll: str
+    name: str | None = None
+    interval: float | None = None
+
+
+@dataclass
+class Module:
+    id: str
+    request: str
+    dids: list[ModuleDid]
+    response: str | None = None
+    discover: list[tuple[str, str]] | None = None
+
+
+@dataclass
+class Profile:
+    schema: int
+    id: str
+    name: str
+    description: str
+    protocol: str
+    vehicles: list[str]
+    sources: list[ProfileSource]
+    modules: list[Module]
+
+
+def _scan_for_vin_like(value: object, path: Path, context: str) -> None:
+    if isinstance(value, str):
+        if VIN_LIKE_PATTERN.fullmatch(value):
+            raise ProfileError(
+                path, context, "looks like a VIN; personal data must never appear in a profile"
+            )
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _scan_for_vin_like(item, path, f"{context}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _scan_for_vin_like(item, path, f"{context}[{index}]")
+
+
+def _check_keys(
+    data: dict[str, object], allowed: set[str], required: set[str], path: Path, context: str
+) -> None:
+    unknown = set(data) - allowed
+    if unknown:
+        raise ProfileError(path, context, f"unknown key(s): {', '.join(sorted(unknown))}")
+    missing = required - set(data)
+    if missing:
+        raise ProfileError(path, context, f"missing required key(s): {', '.join(sorted(missing))}")
+
+
+def _expect_str(data: dict[str, object], key: str, path: Path, context: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise ProfileError(path, f"{context}.{key}", "must be a non-empty string")
+    return value
+
+
+def _load_sources(raw: object, path: Path) -> list[ProfileSource]:
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError(path, "sources", "must be a non-empty list")
+    sources: list[ProfileSource] = []
+    for index, entry in enumerate(raw):
+        context = f"sources[{index}]"
+        if not isinstance(entry, dict):
+            raise ProfileError(path, context, "must be a table")
+        _check_keys(entry, {"title", "url", "license"}, {"title", "url", "license"}, path, context)
+        sources.append(
+            ProfileSource(
+                title=_expect_str(entry, "title", path, context),
+                url=_expect_str(entry, "url", path, context),
+                license=_expect_str(entry, "license", path, context),
+            )
+        )
+    return sources
+
+
+def _load_discover(
+    raw: object, path: Path, context: str
+) -> list[tuple[str, str]] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError(
+            path, f"{context}.discover", "must be a non-empty list of [start, end] pairs"
+        )
+    ranges: list[tuple[str, str]] = []
+    total = 0
+    for index, pair in enumerate(raw):
+        sub = f"{context}.discover[{index}]"
+        is_str_pair = (
+            isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) for x in pair)
+        )
+        if not is_str_pair:
+            raise ProfileError(path, sub, "must be a [start, end] pair of 4-hex-digit strings")
+        start, end = pair
+        if not (PROFILE_DID_PATTERN.fullmatch(start) and PROFILE_DID_PATTERN.fullmatch(end)):
+            raise ProfileError(path, sub, "start/end must be 4 hex digits")
+        start_i, end_i = int(start, 16), int(end, 16)
+        if start_i > end_i:
+            raise ProfileError(path, sub, "start must be <= end")
+        total += end_i - start_i + 1
+        ranges.append((start, end))
+    if total > MAX_SWEEP_DIDS:
+        raise ProfileError(
+            path, f"{context}.discover", f"{total} DIDs exceeds MAX_SWEEP_DIDS ({MAX_SWEEP_DIDS})"
+        )
+    return ranges
+
+
+def _load_dids(raw: object, path: Path, context: str) -> list[ModuleDid]:
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError(path, f"{context}.dids", "must be a non-empty list")
+    dids: list[ModuleDid] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw):
+        sub = f"{context}.dids[{index}]"
+        if not isinstance(entry, dict):
+            raise ProfileError(path, sub, "must be a table")
+        did_keys = {"did", "name", "status", "poll", "interval"}
+        _check_keys(entry, did_keys, {"did", "status", "poll"}, path, sub)
+
+        did = _expect_str(entry, "did", path, sub)
+        if not PROFILE_DID_PATTERN.fullmatch(did):
+            raise ProfileError(path, f"{sub}.did", "must be 4 hex digits")
+        if did in VIN_DIDS:
+            raise ProfileError(path, f"{sub}.did", "VIN DIDs must never be read")
+        if did in seen:
+            raise ProfileError(path, f"{sub}.did", f"duplicate DID {did!r} in module")
+        seen.add(did)
+
+        status = entry.get("status")
+        if status not in PROFILE_STATUSES:
+            raise ProfileError(path, f"{sub}.status", f"must be one of {sorted(PROFILE_STATUSES)}")
+
+        poll = entry.get("poll")
+        if poll not in PROFILE_POLL_MODES:
+            raise ProfileError(path, f"{sub}.poll", f"must be one of {sorted(PROFILE_POLL_MODES)}")
+
+        name = entry.get("name")
+        if name is not None and (not isinstance(name, str) or not name):
+            raise ProfileError(path, f"{sub}.name", "must be a non-empty string if present")
+        if poll != "survey" and name is None:
+            raise ProfileError(path, f"{sub}.name", 'required unless poll is "survey"')
+
+        interval_raw = entry.get("interval")
+        interval: float | None
+        if poll in ("watch", "survey"):
+            if (
+                not isinstance(interval_raw, int | float)
+                or isinstance(interval_raw, bool)
+                or interval_raw < MIN_PROFILE_INTERVAL
+            ):
+                raise ProfileError(
+                    path,
+                    f"{sub}.interval",
+                    f"required for watch/survey, must be a number >= {MIN_PROFILE_INTERVAL}",
+                )
+            interval = float(interval_raw)
+        elif interval_raw is not None:
+            raise ProfileError(path, f"{sub}.interval", "only allowed for poll watch/survey")
+        else:
+            interval = None
+
+        dids.append(ModuleDid(did=did, name=name, status=status, poll=poll, interval=interval))
+    return dids
+
+
+def _load_modules(raw: object, protocol: str, path: Path) -> list[Module]:
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError(path, "modules", "must be a non-empty list")
+    modules: list[Module] = []
+    seen_ids: set[str] = set()
+    for index, entry in enumerate(raw):
+        context = f"modules[{index}]"
+        if not isinstance(entry, dict):
+            raise ProfileError(path, context, "must be a table")
+        _check_keys(
+            entry,
+            {"id", "request", "response", "discover", "dids"},
+            {"id", "request", "dids"},
+            path,
+            context,
+        )
+
+        module_id = _expect_str(entry, "id", path, context)
+        if module_id in seen_ids:
+            raise ProfileError(path, f"{context}.id", f"duplicate module id {module_id!r}")
+        seen_ids.add(module_id)
+
+        request = _expect_str(entry, "request", path, context)
+        if HEADER_29BIT_REQUEST_PATTERN.fullmatch(request):
+            if protocol != "7":
+                raise ProfileError(
+                    path, f"{context}.request", '29-bit header requires profile protocol "7"'
+                )
+        elif HEADER_11BIT_PATTERN.fullmatch(request):
+            if int(request, 16) > 0x7FF:
+                raise ProfileError(path, f"{context}.request", "11-bit header must be <= 7FF")
+        else:
+            raise ProfileError(
+                path, f"{context}.request", "must be 3 hex digits (<= 7FF) or 18DAxxF1"
+            )
+
+        response = entry.get("response")
+        if response is not None and (
+            not isinstance(response, str)
+            or not (
+                HEADER_11BIT_PATTERN.fullmatch(response)
+                or HEADER_29BIT_RESPONSE_PATTERN.fullmatch(response)
+            )
+        ):
+            raise ProfileError(path, f"{context}.response", "must be 3 hex digits or 18DAF1xx")
+
+        discover = _load_discover(entry.get("discover"), path, context)
+        dids = _load_dids(entry.get("dids"), path, context)
+
+        modules.append(
+            Module(id=module_id, request=request, response=response, discover=discover, dids=dids)
+        )
+    return modules
+
+
+def load_profile(path: Path) -> Profile:
+    """Loads and validates one vehicle profile. Profiles are data only: they name
+    addresses and DIDs, never commands, and `module_setup_commands`/the `22<did>`
+    reads built from them still go through `check_sweep_allowed` like any other
+    sweep traffic, so a profile can never introduce a service other than
+    ReadDataByIdentifier (0x22) or a VIN read - the latter is rejected outright."""
+    path = Path(path)
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as error:
+        raise ProfileError(path, "<file>", f"invalid TOML: {error}") from error
+    except OSError as error:
+        raise ProfileError(path, "<file>", str(error)) from error
+
+    _scan_for_vin_like(raw, path, "<root>")
+
+    root_keys = {
+        "schema", "id", "name", "description", "protocol", "vehicles", "sources", "modules"
+    }
+    _check_keys(raw, root_keys, root_keys, path, "<root>")
+
+    if raw.get("schema") != 1:
+        raise ProfileError(path, "schema", "must be 1")
+
+    profile_id = _expect_str(raw, "id", path, "<root>")
+    if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+        raise ProfileError(path, "id", "must match [a-z0-9-]+")
+    if profile_id != path.stem:
+        raise ProfileError(path, "id", f"must equal the file stem {path.stem!r}")
+
+    name = _expect_str(raw, "name", path, "<root>")
+    description = _expect_str(raw, "description", path, "<root>")
+
+    protocol = raw.get("protocol")
+    if protocol not in FORCE_PROTOCOL:
+        raise ProfileError(path, "protocol", f"must be one of {sorted(FORCE_PROTOCOL)}")
+
+    vehicles = raw.get("vehicles")
+    if (
+        not isinstance(vehicles, list)
+        or not vehicles
+        or not all(isinstance(v, str) and v for v in vehicles)
+    ):
+        raise ProfileError(path, "vehicles", "must be a non-empty list of non-empty strings")
+
+    sources = _load_sources(raw.get("sources"), path)
+    modules = _load_modules(raw.get("modules"), protocol, path)
+
+    return Profile(
+        schema=1,
+        id=profile_id,
+        name=name,
+        description=description,
+        protocol=protocol,
+        vehicles=list(vehicles),
+        sources=sources,
+        modules=modules,
+    )
+
+
+def resolve_profile(spec: str) -> Profile:
+    """Resolves `--profile` either as a path to a profile file or as an id looked
+    up in `profiles/` next to this script, then loads and validates it."""
+    candidate = Path(spec)
+    if not candidate.is_file():
+        candidate = PROFILES_DIR / f"{spec}.toml"
+    if not candidate.is_file():
+        raise ProfileError(
+            candidate, "<profile>", f"no profile found for {spec!r} (tried path and profiles/)"
+        )
+    return load_profile(candidate)
+
+
+def module_setup_commands(module: Module) -> list[str]:
+    """The AT header/filter/flow-control commands that put the adapter in a state
+    to talk to one profile module - with flow control for a known response id, or
+    plain receive-any for single-frame-only modules. Every command here still
+    needs `check_sweep_allowed` before it is sent."""
+    if module.response:
+        return [
+            f"ATSH{module.request}",
+            f"ATCRA{module.response}",
+            f"ATFCSH{module.request}",
+            "ATFCSD300000",
+            "ATFCSM1",
+        ]
+    return ["ATFCSM0", "ATAR", f"ATSH{module.request}"]
+
+
+@dataclass
+class ScheduledDid:
+    """One profile DID due for repeated polling, keeping its owning module so the
+    watch loop knows when a header re-setup is needed."""
+
+    module: Module
+    did: ModuleDid
+    command: str
+    interval: float
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.module.id, self.did.did)
+
+
+def build_watch_schedule(
+    modules: list[Module], survey: bool, survey_interval: float
+) -> list[ScheduledDid]:
+    """The DIDs to poll repeatedly across all of a profile's modules: every `watch`
+    DID at its own profile interval, plus every `survey` DID at `survey_interval`
+    when `survey` is enabled."""
+    schedule: list[ScheduledDid] = []
+    for module in modules:
+        for did in module.dids:
+            if did.poll == "watch":
+                assert did.interval is not None
+                schedule.append(ScheduledDid(module, did, f"22{did.did}", did.interval))
+            elif did.poll == "survey" and survey:
+                schedule.append(ScheduledDid(module, did, f"22{did.did}", survey_interval))
+    return schedule
+
+
 @dataclass
 class IsotpParse:
     messages: list[tuple[str, bytes]]
@@ -356,8 +662,6 @@ def classify(command: str, response: str, responder: str | None = None) -> str:
     parsed = parse_isotp(command, response)
     expected = bytes.fromhex(command)
     positive = bytes([expected[0] + 0x40]) + expected[1:]
-    if responder is None and command.startswith("22"):
-        responder = "775" if command.startswith("2218A") else "77A"
     pending = False
     matched = False
     terminal = None
@@ -501,7 +805,7 @@ def start_note_reader(record: Callable[[Exchange, str], None]) -> NoteReader:
 class LiveValue:
     """Last known value for one polled command, with its own fetch time so a
     consumer (terminal summary today, an app later) can show age and never has
-    to block waiting for a fresher read — see WATCH_PLAN."""
+    to block waiting for a fresher read - see `build_watch_schedule`."""
 
     response: str
     status: str
@@ -517,17 +821,8 @@ def format_live_summary(latest: dict[str, LiveValue]) -> str:
     return "live: " + (" ".join(parts) if parts else "-")
 
 
-def watch_schedule(survey: bool, survey_interval: float) -> dict[str, float]:
-    """The combined per-command poll intervals for `session`'s watch loop: WATCH_PLAN
-    always, plus GATEWAY_SURVEY at a single interval when `--survey` is enabled."""
-    plan = dict(WATCH_PLAN)
-    if survey:
-        plan.update(dict.fromkeys(GATEWAY_SURVEY, survey_interval))
-    return plan
-
-
-def _due_commands(next_due: dict[str, float], now: float) -> list[str]:
-    return [cmd for cmd, t in next_due.items() if t <= now]
+def _due_commands[K](next_due: dict[K, float], now: float) -> list[K]:
+    return [key for key, t in next_due.items() if t <= now]
 
 
 class ElmSession:
@@ -712,6 +1007,45 @@ async def connect_adapter(
         await client.stop_notify(UART_NOTIFY)
 
 
+async def run_watch_loop(
+    execute: Callable[[str, str, Callable[[str], str], str | None], Awaitable[Exchange]],
+    schedule: list[ScheduledDid],
+    deadline: float | None,
+    watch_stage: str,
+    survey_stage: str,
+) -> None:
+    """Polls `schedule` forever (`deadline=None`) or until `deadline`
+    (a `time.monotonic()` value), grouping due DIDs by module so a header/filter
+    re-setup (`module_setup_commands`) only runs when the module actually changes."""
+    if not schedule:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        return
+    next_due = dict.fromkeys((entry.key for entry in schedule), time.monotonic())
+    by_key = {entry.key: entry for entry in schedule}
+    latest: dict[str, LiveValue] = {}
+    current_module_id: str | None = None
+    while deadline is None or time.monotonic() < deadline:
+        now = time.monotonic()
+        due = sorted(_due_commands(next_due, now))
+        if not due:
+            await asyncio.sleep(min(1.0, min(next_due.values()) - now))
+            continue
+        for key in due:
+            entry = by_key[key]
+            if entry.module.id != current_module_id:
+                for cmd in module_setup_commands(entry.module):
+                    await execute(cmd, f"{watch_stage}-setup", check_sweep_allowed, None)
+                current_module_id = entry.module.id
+            stage = watch_stage if entry.did.poll == "watch" else survey_stage
+            ex = await execute(entry.command, stage, check_sweep_allowed, entry.module.response)
+            latest[entry.command] = LiveValue(ex.response, ex.status, time.monotonic())
+            next_due[key] = time.monotonic() + entry.interval
+        print(format_live_summary(latest))
+
+
 async def _probe(
     address: str,
     stages: str,
@@ -720,6 +1054,7 @@ async def _probe(
     pair: bool,
     protocol: str | None = None,
     watch_seconds: float = 0.0,
+    profile: Profile | None = None,
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -741,26 +1076,22 @@ async def _probe(
                 await execute(cmd, "setup")
         for stage in stages:
             if stage == "E":
-                for cmd in STAGE_E_GATEWAY:
-                    await execute(cmd, stage)
+                assert profile is not None  # enforced by argument parsing in main()
+                for module in profile.modules:
+                    for cmd in module_setup_commands(module):
+                        await execute(cmd, stage, check_sweep_allowed)
+                    for did in module.dids:
+                        if did.poll in ("once", "watch"):
+                            await execute(
+                                f"22{did.did}", stage, check_sweep_allowed, module.response
+                            )
                 if watch_seconds > 0:
-                    latest: dict[str, LiveValue] = {}
-                    now = time.monotonic()
-                    next_due = dict.fromkeys(WATCH_PLAN, now)
-                    deadline = now + watch_seconds
-                    while time.monotonic() < deadline:
-                        now = time.monotonic()
-                        due = [cmd for cmd, t in next_due.items() if t <= now]
-                        if not due:
-                            await asyncio.sleep(min(1.0, min(next_due.values()) - now))
-                            continue
-                        for cmd in due:
-                            ex = await execute(cmd, "E-watch")
-                            latest[cmd] = LiveValue(ex.response, ex.status, time.monotonic())
-                            next_due[cmd] = time.monotonic() + WATCH_PLAN[cmd]
-                        print(format_live_summary(latest))
-                for cmd in STAGE_E_REST:
-                    await execute(cmd, stage)
+                    schedule = build_watch_schedule(
+                        profile.modules, survey=False, survey_interval=0.0
+                    )
+                    await run_watch_loop(
+                        execute, schedule, time.monotonic() + watch_seconds, "E-watch", "E-watch"
+                    )
                 continue
             commands = list(STAGES[stage])
             if stage == "B" and protocol is not None:
@@ -1067,14 +1398,17 @@ async def run_session(
     out_dir: Path,
     pair: bool,
     protocol: str | None,
+    profile: Profile | None = None,
     survey: bool = False,
     survey_interval: float = 60.0,
 ) -> int:
     """One continuous log for a whole outing (ignition on -> driving -> charging ->
-    driving home): a single thorough pass (adapter, protocol, legislative OBD, gateway +
-    its neighbourhood, tyres + their neighbourhood, cluster odometer), then an
-    indefinite WATCH_PLAN poll that only stops on Ctrl-C - so the whole trip ends
-    up in one log file instead of several `probe`/`sweep` runs."""
+    driving home): a single thorough pass (adapter, protocol, legislative OBD, then -
+    with a profile - every module's one-shot DIDs and discovery sweeps), then an
+    indefinite watch-DID poll that only stops on Ctrl-C - so the whole trip ends up
+    in one log file instead of several `probe`/`sweep` runs. Without `profile`, stage
+    E and the watch loop are skipped entirely; the adapter/protocol/mode-01 parts
+    still run."""
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = out_dir / f"didscout_{stamp}_{label}.jsonl"
@@ -1086,73 +1420,62 @@ async def run_session(
         session = link.session
         record = link.record
 
+        async def execute(
+            command: str, stage: str, validator: Callable[[str], str] = check_allowed,
+            responder: str | None = None,
+        ) -> Exchange:
+            ex = await session.run(command, validator, responder)
+            record(ex, stage)
+            return ex
+
         note_reader = start_note_reader(record)
 
         for cmd in ADAPTER_SETUP:
-            record(await session.run(cmd), "setup")
+            await execute(cmd, "setup")
         for cmd in ("ATI", "STI", "STDI", "ATRV"):
-            record(await session.run(cmd), "A")
-        record(await session.run(FORCE_PROTOCOL[protocol] if protocol else "ATSP0"), "B")
-        record(await session.run("0100"), "B")
-        record(await session.run("ATDPN"), "B")
+            await execute(cmd, "A")
+        await execute(FORCE_PROTOCOL[protocol] if protocol else "ATSP0", "B")
+        await execute("0100", "B")
+        await execute("ATDPN", "B")
 
         bitmaps: list[str] = []
         for cmd in STAGES["C"]:
-            ex = await session.run(cmd)
-            record(ex, "C")
+            ex = await execute(cmd, "C")
             bitmaps.append(ex.response)
         supported = supported_pids(bitmaps)
         print(f"[C] supported mode-01 PIDs: {' '.join(sorted(supported)) or '-'}")
         for pid, cmd in STAGE_C_CANDIDATES.items():
             if pid in supported:
-                record(await session.run(cmd), "C")
+                await execute(cmd, "C")
 
-        for cmd in STAGE_E_GATEWAY:
-            record(await session.run(cmd), "E")
-        start_i, end_i = SESSION_SWEEP_RANGES["710"]
-        await sweep_range(session, record, start_i, end_i, "sweep-710", "77A")
+        if profile is not None:
+            for module in profile.modules:
+                for cmd in module_setup_commands(module):
+                    await execute(cmd, "E", check_sweep_allowed)
+                for did in module.dids:
+                    if did.poll in ("once", "watch"):
+                        await execute(f"22{did.did}", "E", check_sweep_allowed, module.response)
+                for start, end in module.discover or []:
+                    await sweep_range(
+                        session,
+                        record,
+                        int(start, 16),
+                        int(end, 16),
+                        f"sweep-{module.id}",
+                        module.response,
+                    )
 
-        record(await session.run("ATSH70B"), "E")
-        record(await session.run("ATCRA775"), "E")
-        record(await session.run("ATFCSH70B"), "E")
-        for cmd in ("2218A0", "2218A1", "2218A2", "2218A3"):
-            record(await session.run(cmd), "E")
-        start_i, end_i = SESSION_SWEEP_RANGES["70B"]
-        await sweep_range(session, record, start_i, end_i, "sweep-70B", "775")
-        record(await session.run("ATFCSM0"), "E")
-        record(await session.run("ATAR"), "E")
-        record(await session.run("ATSH714"), "E")
-        record(await session.run("222203"), "E")
+            print()
+            print(
+                "Now type and Enter: state of charge, odometer, outside temperature, "
+                "battery temperature - then drive. Keeps running in the background, "
+                "press Ctrl-C after the drive home to stop."
+            )
+            print()
 
-        # Keep ATE0/ATL0/ATS0/ATH1 intact. ATD here used to reset those settings
-        # and switched watch replies into ELM's numbered assembled format.
-        for cmd in ("ATSH710", "ATCRA77A", "ATFCSH710", "ATFCSD300000", "ATFCSM1"):
-            record(await session.run(cmd), "E")
-
-        print()
-        print(
-            "Now type and Enter: state of charge, odometer, outside temperature, "
-            "battery temperature - then drive. Keeps running in the background, "
-            "press Ctrl-C after the drive home to stop."
-        )
-        print()
-
-        intervals = watch_schedule(survey, survey_interval)
-        latest: dict[str, LiveValue] = {}
-        next_due = dict.fromkeys(intervals, time.monotonic())
+        schedule = build_watch_schedule(profile.modules, survey, survey_interval) if profile else []
         try:
-            while True:
-                now = time.monotonic()
-                due = _due_commands(next_due, now)
-                if not due:
-                    await asyncio.sleep(min(1.0, min(next_due.values()) - now))
-                    continue
-                for cmd in due:
-                    ex = await session.run(cmd)
-                    record(ex, "E-survey" if cmd in GATEWAY_SURVEY else "E-watch")
-                    latest[cmd] = LiveValue(ex.response, ex.status, time.monotonic())
-                    next_due[cmd] = time.monotonic() + intervals[cmd]
-                print(format_live_summary(latest))
+            await run_watch_loop(execute, schedule, None, "E-watch", "E-survey")
         except asyncio.CancelledError:
             cancelled = True
             print("\n[session] Ctrl-C detected, shutting down cleanly...")
@@ -1185,9 +1508,10 @@ async def probe(
     pair: bool,
     protocol: str | None = None,
     watch_seconds: float = 0.0,
+    profile: Profile | None = None,
 ) -> int:
     try:
-        return await _probe(address, stages, label, out_dir, pair, protocol, watch_seconds)
+        return await _probe(address, stages, label, out_dir, pair, protocol, watch_seconds, profile)
     except ProbeAbortedError as error:
         print(f"Probe aborted: {error}", file=sys.stderr)
         return 2
@@ -1221,8 +1545,11 @@ def main(argv: list[str]) -> int:
         "--watch-seconds",
         type=float,
         default=0.0,
-        help="after stage E's gateway reads, poll every command in WATCH_PLAN at its own "
-        "interval for this long (e.g. during AC charging) before continuing to tyres/odometer",
+        help="after stage E's one-shot reads, poll every profile DID marked watch at its own "
+        "interval for this long (e.g. during AC charging)",
+    )
+    p.add_argument(
+        "--profile", help="vehicle profile id (profiles/<id>.toml) or path; required for stage E"
     )
     w = sub.add_parser(
         "sweep",
@@ -1293,8 +1620,8 @@ def main(argv: list[str]) -> int:
     )
     n = sub.add_parser(
         "session",
-        help="one continuous log for a whole outing: full one-shot pass (incl. both "
-        "neighbourhood sweeps), then indefinite WATCH_PLAN polling until Ctrl-C",
+        help="one continuous log for a whole outing: full one-shot pass (incl. the profile's "
+        "discovery sweeps), then indefinite watch-DID polling until Ctrl-C",
     )
     n.add_argument("address", help="BLE address from `scan`")
     n.add_argument(
@@ -1310,9 +1637,14 @@ def main(argv: list[str]) -> int:
         help="force CAN protocol instead of ATSP0 auto-detect: 6 = 11-bit/500k, 7 = 29-bit/500k",
     )
     n.add_argument(
+        "--profile",
+        help="vehicle profile id (profiles/<id>.toml) or path; without it, stage E and the "
+        "watch loop are skipped",
+    )
+    n.add_argument(
         "--survey",
         action="store_true",
-        help="also poll GATEWAY_SURVEY (710/77A DIDs not yet in WATCH_PLAN) at --survey-interval",
+        help="also poll each profile DID marked survey (not yet watch-worthy) at --survey-interval",
     )
     n.add_argument(
         "--survey-interval",
@@ -1381,6 +1713,12 @@ def main(argv: list[str]) -> int:
     if args.mode == "session":
         if args.survey_interval < 15:
             parser.error("--survey-interval must be >= 15 seconds")
+        profile = None
+        if args.profile:
+            try:
+                profile = resolve_profile(args.profile)
+            except ProfileError as error:
+                parser.error(str(error))
         return asyncio.run(
             run_session(
                 args.address,
@@ -1388,6 +1726,7 @@ def main(argv: list[str]) -> int:
                 args.out,
                 args.pair,
                 args.protocol,
+                profile,
                 args.survey,
                 args.survey_interval,
             )
@@ -1397,6 +1736,14 @@ def main(argv: list[str]) -> int:
         parser.error("--stages must only contain A-E")
     if args.watch_seconds and "E" not in stages:
         parser.error("--watch-seconds requires stage E")
+    profile = None
+    if "E" in stages:
+        if not args.profile:
+            parser.error("stage E requires --profile")
+        try:
+            profile = resolve_profile(args.profile)
+        except ProfileError as error:
+            parser.error(str(error))
     if "E" in stages and "B" not in stages:
         stages = "B" + stages
     return asyncio.run(
@@ -1408,6 +1755,7 @@ def main(argv: list[str]) -> int:
             args.pair,
             args.protocol,
             args.watch_seconds,
+            profile,
         )
     )
 

@@ -597,6 +597,162 @@ def test_unknown_command_is_rejected_before_sending() -> None:
     assert sent == []
 
 
+def test_adapter_link_execute_logs_and_passes_through_noncritical_status() -> None:
+    async def scenario() -> None:
+        async def write(_data: bytes) -> None:
+            session.on_notify(b"?\r>")
+
+        session = cx.ElmSession(write, 20)
+        logged: list[tuple[str, str]] = []
+        link = cx.AdapterLink(session, lambda ex, stage: logged.append((ex.command, stage)))
+
+        # ATI is in the default non-critical set, so a reply that doesn't classify
+        # as OK must not abort - but it's still recorded.
+        ex = await link.execute("ATI", "A")
+        assert ex.status == "?"
+        assert logged == [("ATI", "A")]
+
+    asyncio.run(scenario())
+
+
+def test_adapter_link_execute_fails_closed_on_critical_at_not_ok() -> None:
+    async def scenario() -> None:
+        async def write(_data: bytes) -> None:
+            session.on_notify(b"?\r>")
+
+        session = cx.ElmSession(write, 20)
+        link = cx.AdapterLink(session, lambda ex, stage: None)
+
+        with pytest.raises(cx.ProbeAbortedError):
+            await link.execute("ATE0", "setup")
+
+    asyncio.run(scenario())
+
+
+def test_adapter_link_execute_fails_closed_on_unusable_session() -> None:
+    async def scenario() -> None:
+        async def write(_data: bytes) -> None:
+            raise OSError("synthetic disconnect")
+
+        session = cx.ElmSession(write, 20)
+        link = cx.AdapterLink(session, lambda ex, stage: None)
+
+        # ATRV is non-critical, but a session that lost synchronization must still
+        # fail closed rather than let the caller send a next command.
+        with pytest.raises(cx.ProbeAbortedError):
+            await link.execute("ATRV", "A")
+        assert not session.usable
+
+    asyncio.run(scenario())
+
+
+def test_connect_adapter_yields_link_that_logs_each_exchange(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeCharacteristic:
+        properties = ["write-without-response"]
+
+    class FakeServices:
+        def get_characteristic(self, _uuid: str) -> FakeCharacteristic:
+            return FakeCharacteristic()
+
+    class FakeClient:
+        mtu_size = 23
+        services = FakeServices()
+
+        def __init__(self, _address: str, *, timeout: float) -> None:
+            self.callback: Callable[[object, bytes], None] | None = None
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: TracebackType | None,
+        ) -> None:
+            pass
+
+        async def pair(self) -> None:
+            pass
+
+        async def start_notify(self, _uuid: str, callback: Callable[[object, bytes], None]) -> None:
+            self.callback = callback
+
+        async def stop_notify(self, _uuid: str) -> None:
+            pass
+
+        async def write_gatt_char(
+            self, _characteristic: FakeCharacteristic, data: bytes, *, response: bool
+        ) -> None:
+            assert self.callback is not None
+            self.callback(None, b"OK\r>")
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    log_path = tmp_path / "link.jsonl"
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, log_path, "mystate") as link:
+            assert link is not None
+            await link.execute("ATE0", "setup")
+
+    asyncio.run(scenario())
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries == [
+        {
+            "stage": "setup",
+            "state": "mystate",
+            "mtu": 23,
+            "command": "ATE0",
+            "response": entries[0]["response"],
+            "status": "OK",
+            "started_utc": entries[0]["started_utc"],
+            "duration_ms": entries[0]["duration_ms"],
+        }
+    ]
+
+
+def test_connect_adapter_yields_none_without_write_characteristic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeServices:
+        def get_characteristic(self, _uuid: str) -> None:
+            return None
+
+    class FakeClient:
+        mtu_size = 23
+        services = FakeServices()
+
+        def __init__(self, _address: str, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: TracebackType | None,
+        ) -> None:
+            pass
+
+        async def pair(self) -> None:
+            pass
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    log_path = tmp_path / "missing.jsonl"
+
+    async def scenario() -> bool:
+        async with cx.connect_adapter("fake", False, log_path, "mystate") as link:
+            return link is None
+
+    assert asyncio.run(scenario()) is True
+    assert not log_path.exists()
+
+
 def test_negative_response_codes() -> None:
     assert cx.classify("222AB8", "77A037F2231") == "NRC 31 requestOutOfRange"
     assert cx.classify("222AB8", "77A037F2233") == "NRC 33 securityAccessDenied"

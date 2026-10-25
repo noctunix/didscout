@@ -16,7 +16,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -639,20 +639,49 @@ class ProbeAbortedError(Exception):
     pass
 
 
-async def _probe(
-    address: str,
-    stages: str,
-    label: str,
-    out_dir: Path,
-    pair: bool,
-    protocol: str | None = None,
-    watch_seconds: float = 0.0,
-) -> int:
-    from bleak import BleakClient
+# AT commands whose non-OK reply doesn't abort a probe: informational banners/
+# voltage/protocol-name queries, and ATMA, which never replies OK.
+DEFAULT_NON_CRITICAL_AT = frozenset({"ATI", "ATRV", "ATDPN", "ATMA"})
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = out_dir / f"didscout_{stamp}_{label}.jsonl"
+
+@dataclass
+class AdapterLink:
+    """One connected BLE UART adapter, wired up for ELM327/STN command/response
+    traffic and JSONL logging. Yielded by `connect_adapter`."""
+
+    session: ElmSession
+    record: Callable[[Exchange, str], None]
+    non_critical_at: frozenset[str] = DEFAULT_NON_CRITICAL_AT
+
+    async def execute(
+        self,
+        command: str,
+        stage: str,
+        validator: Callable[[str], str] = check_allowed,
+        responder: str | None = None,
+    ) -> Exchange:
+        """Runs and logs `command`; fails closed by raising ProbeAbortedError if the
+        session became unusable or a critical AT command did not come back OK."""
+        ex = await self.session.run(command, validator, responder)
+        self.record(ex, stage)
+        critical = command.startswith("AT") and command not in self.non_critical_at
+        if not self.session.usable or (critical and ex.status != "OK"):
+            raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
+        return ex
+
+
+@contextlib.asynccontextmanager
+async def connect_adapter(
+    address: str,
+    pair: bool,
+    log_path: Path,
+    label: str,
+    non_critical_at: frozenset[str] = DEFAULT_NON_CRITICAL_AT,
+) -> AsyncIterator[AdapterLink | None]:
+    """Connects to the BLE UART adapter and yields an AdapterLink shared by every
+    mode - or None if the adapter has no UART write characteristic (wrong device),
+    in which case the caller must return 2 without sending anything."""
+    from bleak import BleakClient
 
     async with BleakClient(address, timeout=20.0) as client:
         if pair:
@@ -661,7 +690,8 @@ async def _probe(
         write_char = client.services.get_characteristic(UART_WRITE)
         if write_char is None:
             print("UART write characteristic not found - wrong device?", file=sys.stderr)
-            return 2
+            yield None
+            return
         with_response = "write-without-response" not in write_char.properties
         session = ElmSession(
             lambda data: client.write_gatt_char(write_char, data, response=with_response), chunk
@@ -678,62 +708,75 @@ async def _probe(
                 status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
                 print(f"{status}  {first[:60]}")
 
-            async def execute(cmd: str, stage: str) -> Exchange:
-                ex = await session.run(cmd)
-                record(ex, stage)
-                critical = cmd.startswith("AT") and cmd not in {"ATI", "ATRV", "ATDPN", "ATMA"}
-                if not session.usable or (critical and ex.status != "OK"):
-                    raise ProbeAbortedError(f"{cmd}: {ex.status}; disconnect and retry")
-                return ex
-
-            print(
-                "(notes - e.g. a reading off the display - type any time + Enter, "
-                "land timestamped in the same log)"
-            )
-            note_reader = start_note_reader(record)
-
-            if "A" not in stages:
-                for cmd in ADAPTER_SETUP:
-                    await execute(cmd, "setup")
-            for stage in stages:
-                if stage == "E":
-                    for cmd in STAGE_E_GATEWAY:
-                        await execute(cmd, stage)
-                    if watch_seconds > 0:
-                        latest: dict[str, LiveValue] = {}
-                        now = time.monotonic()
-                        next_due = dict.fromkeys(WATCH_PLAN, now)
-                        deadline = now + watch_seconds
-                        while time.monotonic() < deadline:
-                            now = time.monotonic()
-                            due = [cmd for cmd, t in next_due.items() if t <= now]
-                            if not due:
-                                await asyncio.sleep(min(1.0, min(next_due.values()) - now))
-                                continue
-                            for cmd in due:
-                                ex = await execute(cmd, "E-watch")
-                                latest[cmd] = LiveValue(ex.response, ex.status, time.monotonic())
-                                next_due[cmd] = time.monotonic() + WATCH_PLAN[cmd]
-                            print(format_live_summary(latest))
-                    for cmd in STAGE_E_REST:
-                        await execute(cmd, stage)
-                    continue
-                commands = list(STAGES[stage])
-                if stage == "B" and protocol is not None:
-                    commands[0] = FORCE_PROTOCOL[protocol]
-                bitmaps: list[str] = []
-                for cmd in commands:
-                    ex = await execute(cmd, stage)
-                    if stage == "C" and ex.status == "OK":
-                        bitmaps.append(ex.response)
-                if stage == "C":
-                    supported = supported_pids(bitmaps)
-                    print(f"[C] supported mode-01 PIDs: {' '.join(sorted(supported)) or '-'}")
-                    for pid, cmd in STAGE_C_CANDIDATES.items():
-                        if pid in supported:
-                            await execute(cmd, stage)
-            await note_reader.stop()
+            yield AdapterLink(session, record, non_critical_at)
         await client.stop_notify(UART_NOTIFY)
+
+
+async def _probe(
+    address: str,
+    stages: str,
+    label: str,
+    out_dir: Path,
+    pair: bool,
+    protocol: str | None = None,
+    watch_seconds: float = 0.0,
+) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = out_dir / f"didscout_{stamp}_{label}.jsonl"
+
+    async with connect_adapter(address, pair, log_path, label) as link:
+        if link is None:
+            return 2
+        execute = link.execute
+
+        print(
+            "(notes - e.g. a reading off the display - type any time + Enter, "
+            "land timestamped in the same log)"
+        )
+        note_reader = start_note_reader(link.record)
+
+        if "A" not in stages:
+            for cmd in ADAPTER_SETUP:
+                await execute(cmd, "setup")
+        for stage in stages:
+            if stage == "E":
+                for cmd in STAGE_E_GATEWAY:
+                    await execute(cmd, stage)
+                if watch_seconds > 0:
+                    latest: dict[str, LiveValue] = {}
+                    now = time.monotonic()
+                    next_due = dict.fromkeys(WATCH_PLAN, now)
+                    deadline = now + watch_seconds
+                    while time.monotonic() < deadline:
+                        now = time.monotonic()
+                        due = [cmd for cmd, t in next_due.items() if t <= now]
+                        if not due:
+                            await asyncio.sleep(min(1.0, min(next_due.values()) - now))
+                            continue
+                        for cmd in due:
+                            ex = await execute(cmd, "E-watch")
+                            latest[cmd] = LiveValue(ex.response, ex.status, time.monotonic())
+                            next_due[cmd] = time.monotonic() + WATCH_PLAN[cmd]
+                        print(format_live_summary(latest))
+                for cmd in STAGE_E_REST:
+                    await execute(cmd, stage)
+                continue
+            commands = list(STAGES[stage])
+            if stage == "B" and protocol is not None:
+                commands[0] = FORCE_PROTOCOL[protocol]
+            bitmaps: list[str] = []
+            for cmd in commands:
+                ex = await execute(cmd, stage)
+                if stage == "C" and ex.status == "OK":
+                    bitmaps.append(ex.response)
+            if stage == "C":
+                supported = supported_pids(bitmaps)
+                print(f"[C] supported mode-01 PIDs: {' '.join(sorted(supported)) or '-'}")
+                for pid, cmd in STAGE_C_CANDIDATES.items():
+                    if pid in supported:
+                        await execute(cmd, stage)
+        await note_reader.stop()
     print(f"log: {log_path}")
     return 0
 
@@ -811,8 +854,6 @@ async def sweep(
     fixed header or, with `obduds_ecus`, at every regulated 29-bit ECU discovered via
     SAE J1979-2. Only service 0x22 ever leaves check_sweep_allowed, so this can't
     drift into a write/reset/security service regardless of the DID range."""
-    from bleak import BleakClient
-
     start_i, end_i = int(start, 16), int(end, 16)
     if not (0 <= start_i <= end_i <= 0xFFFF):
         print("--start/--end must be 0000-FFFF with start <= end", file=sys.stderr)
@@ -830,94 +871,66 @@ async def sweep(
     suffix = "obduds-ecus" if obduds_ecus else header
     log_path = out_dir / f"didscout_{stamp}_{label}_sweep{suffix}.jsonl"
 
-    async with BleakClient(address, timeout=20.0) as client:
-        if pair:
-            await client.pair()
-        chunk = max(20, client.mtu_size - 3)
-        write_char = client.services.get_characteristic(UART_WRITE)
-        if write_char is None:
-            print("UART write characteristic not found - wrong device?", file=sys.stderr)
+    async with connect_adapter(address, pair, log_path, label, frozenset({"ATDPN"})) as link:
+        if link is None:
             return 2
-        with_response = "write-without-response" not in write_char.properties
-        session = ElmSession(
-            lambda data: client.write_gatt_char(write_char, data, response=with_response), chunk
-        )
-        await client.start_notify(UART_NOTIFY, lambda _c, data: session.on_notify(bytes(data)))
+        session = link.session
+        record = link.record
 
-        with log_path.open("a", encoding="utf-8") as log:
+        if obduds_ecus:
+            result = 0
+            hits: list[tuple[str, str]] = []
 
-            def record(ex: Exchange, stage: str) -> None:
-                entry = {"stage": stage, "state": label, "mtu": client.mtu_size, **ex.__dict__}
-                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                log.flush()
-                first = ex.response.splitlines()[0] if ex.response else ""
-                status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
-                print(f"{status}  {first[:60]}")
+            async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
+                return await link.execute(command, stage, check_obduds_allowed, responder)
 
-            if obduds_ecus:
-                result = 0
-                hits: list[tuple[str, str]] = []
-
-                async def execute(
-                    command: str, stage: str, responder: str | None = None
-                ) -> Exchange:
-                    ex = await session.run(command, check_obduds_allowed, responder)
-                    record(ex, stage)
-                    critical = command.startswith("AT") and command != "ATDPN"
-                    if not session.usable or (critical and ex.status != "OK"):
-                        raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
-                    return ex
-
-                try:
-                    for cmd in ADAPTER_SETUP:
-                        await execute(cmd, "setup")
-                    responders = await obduds_discover(execute)
-                    print(f"[sweep] regulated responders: {' '.join(responders) or '-'}")
-                    if not responders:
-                        result = 2
-                    elif count * len(responders) > MAX_SWEEP_DIDS:
-                        print(
-                            f"{count} DIDs x {len(responders)} ECUs exceeds MAX_SWEEP_DIDS "
-                            f"({MAX_SWEEP_DIDS}) - split the range",
-                            file=sys.stderr,
-                        )
-                        result = 2
-                    else:
-                        for responder in responders:
-                            ecu = await obduds_select_responder(execute, responder, "setup")
-                            hits.extend(
-                                await sweep_range(
-                                    session, record, start_i, end_i, f"sweep-{ecu}", responder
-                                )
-                            )
-                except ProbeAbortedError as error:
-                    print(f"sweep --obduds-ecus aborted: {error}", file=sys.stderr)
-                    result = 2
-                finally:
-                    if session.usable:
-                        for cmd in ("ATFCSM0", "ATAR", "ATD"):
-                            record(await session.run(cmd, check_obduds_allowed), "cleanup")
-            else:
-                result = 0
+            try:
                 for cmd in ADAPTER_SETUP:
-                    record(await session.run(cmd), "setup")
-                record(
-                    await session.run(FORCE_PROTOCOL[protocol] if protocol else "ATSP0"), "setup"
-                )
-                record(await session.run(f"ATSH{header}", check_sweep_allowed), "setup")
-                if rax:
-                    record(await session.run(f"ATCRA{rax}", check_sweep_allowed), "setup")
-                    record(await session.run(f"ATFCSH{header}", check_sweep_allowed), "setup")
-                    record(await session.run("ATFCSD300000"), "setup")
-                    record(await session.run("ATFCSM1"), "setup")
+                    await execute(cmd, "setup")
+                responders = await obduds_discover(execute)
+                print(f"[sweep] regulated responders: {' '.join(responders) or '-'}")
+                if not responders:
+                    result = 2
+                elif count * len(responders) > MAX_SWEEP_DIDS:
+                    print(
+                        f"{count} DIDs x {len(responders)} ECUs exceeds MAX_SWEEP_DIDS "
+                        f"({MAX_SWEEP_DIDS}) - split the range",
+                        file=sys.stderr,
+                    )
+                    result = 2
+                else:
+                    for responder in responders:
+                        ecu = await obduds_select_responder(execute, responder, "setup")
+                        hits.extend(
+                            await sweep_range(
+                                session, record, start_i, end_i, f"sweep-{ecu}", responder
+                            )
+                        )
+            except ProbeAbortedError as error:
+                print(f"sweep --obduds-ecus aborted: {error}", file=sys.stderr)
+                result = 2
+            finally:
+                if session.usable:
+                    for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                        record(await session.run(cmd, check_obduds_allowed), "cleanup")
+        else:
+            result = 0
+            for cmd in ADAPTER_SETUP:
+                record(await session.run(cmd), "setup")
+            record(await session.run(FORCE_PROTOCOL[protocol] if protocol else "ATSP0"), "setup")
+            record(await session.run(f"ATSH{header}", check_sweep_allowed), "setup")
+            if rax:
+                record(await session.run(f"ATCRA{rax}", check_sweep_allowed), "setup")
+                record(await session.run(f"ATFCSH{header}", check_sweep_allowed), "setup")
+                record(await session.run("ATFCSD300000"), "setup")
+                record(await session.run("ATFCSM1"), "setup")
 
-                hits = await sweep_range(session, record, start_i, end_i, responder=rax)
+            hits = await sweep_range(session, record, start_i, end_i, responder=rax)
 
-                if rax:
-                    record(await session.run("ATFCSM0"), "cleanup")
-                record(await session.run("ATAR"), "cleanup")
-                record(await session.run("ATD"), "cleanup")
-        await client.stop_notify(UART_NOTIFY)
+            if rax:
+                record(await session.run("ATFCSM0"), "cleanup")
+            record(await session.run("ATAR"), "cleanup")
+            record(await session.run("ATD"), "cleanup")
     print(f"log: {log_path}")
     print(f"hits: {hits or '-'}")
     return result
@@ -931,93 +944,65 @@ async def obduds_probe(
     support_only: bool,
 ) -> int:
     """Discover regulated UDS ECUs, then read only their advertised F4xx/F5xx DIDs."""
-    from bleak import BleakClient
-
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = out_dir / f"didscout_{stamp}_{label}_obduds.jsonl"
     result = 0
 
-    async with BleakClient(address, timeout=20.0) as client:
-        if pair:
-            await client.pair()
-        chunk = max(20, client.mtu_size - 3)
-        write_char = client.services.get_characteristic(UART_WRITE)
-        if write_char is None:
-            print("UART write characteristic not found - wrong device?", file=sys.stderr)
+    async with connect_adapter(address, pair, log_path, label, frozenset({"ATDPN"})) as link:
+        if link is None:
             return 2
-        with_response = "write-without-response" not in write_char.properties
-        session = ElmSession(
-            lambda data: client.write_gatt_char(write_char, data, response=with_response), chunk
-        )
-        await client.start_notify(UART_NOTIFY, lambda _c, data: session.on_notify(bytes(data)))
 
-        with log_path.open("a", encoding="utf-8") as log:
+        async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
+            return await link.execute(command, stage, check_obduds_allowed, responder)
 
-            def record(ex: Exchange, stage: str) -> None:
-                entry = {"stage": stage, "state": label, "mtu": client.mtu_size, **ex.__dict__}
-                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                log.flush()
-                first = ex.response.splitlines()[0] if ex.response else ""
-                status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
-                print(f"{status}  {first[:60]}")
-
-            async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
-                ex = await session.run(command, check_obduds_allowed, responder)
-                record(ex, stage)
-                critical = command.startswith("AT") and command != "ATDPN"
-                if not session.usable or (critical and ex.status != "OK"):
-                    raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
-                return ex
-
-            try:
-                for cmd in ADAPTER_SETUP:
-                    await execute(cmd, "obduds-setup")
-                responders = await obduds_discover(execute)
-                print(f"[obduds] regulated responders: {' '.join(responders) or '-'}")
-                if not responders:
-                    result = 2
-
-                for responder in responders:
-                    ecu = await obduds_select_responder(execute, responder, "obduds-setup")
-
-                    supported: set[int] = set()
-                    base = OBDUDS_FIRST_SUPPORT_DID
-                    while base <= OBDUDS_LAST_SUPPORT_DID:
-                        command = f"22{base:04X}"
-                        ex = await execute(command, f"obduds-support-{ecu}", responder)
-                        if ex.status != "OK":
-                            break
-                        announced = obduds_supported_dids(command, ex.response, responder)
-                        supported.update(announced)
-                        next_base = base + 0x20
-                        if next_base not in announced:
-                            break
-                        base = next_base
-
-                    data_dids = sorted(did for did in supported if did & 0x1F)
-                    print(
-                        f"[obduds {responder}] supported data DIDs: "
-                        f"{' '.join(f'{did:04X}' for did in data_dids) or '-'}"
-                    )
-                    if support_only:
-                        continue
-                    if len(data_dids) > OBDUDS_MAX_DATA_DIDS:
-                        raise ProbeAbortedError(
-                            f"{responder} announced {len(data_dids)} DIDs; "
-                            f"limit is {OBDUDS_MAX_DATA_DIDS}"
-                        )
-                    for did in data_dids:
-                        await execute(f"22{did:04X}", f"obduds-data-{ecu}", responder)
-            except ProbeAbortedError as error:
-                print(f"OBDonUDS probe aborted: {error}", file=sys.stderr)
+        try:
+            for cmd in ADAPTER_SETUP:
+                await execute(cmd, "obduds-setup")
+            responders = await obduds_discover(execute)
+            print(f"[obduds] regulated responders: {' '.join(responders) or '-'}")
+            if not responders:
                 result = 2
-            finally:
-                if session.usable:
-                    for cmd in ("ATFCSM0", "ATAR", "ATD"):
-                        ex = await session.run(cmd, check_obduds_allowed)
-                        record(ex, "obduds-cleanup")
-                await client.stop_notify(UART_NOTIFY)
+
+            for responder in responders:
+                ecu = await obduds_select_responder(execute, responder, "obduds-setup")
+
+                supported: set[int] = set()
+                base = OBDUDS_FIRST_SUPPORT_DID
+                while base <= OBDUDS_LAST_SUPPORT_DID:
+                    command = f"22{base:04X}"
+                    ex = await execute(command, f"obduds-support-{ecu}", responder)
+                    if ex.status != "OK":
+                        break
+                    announced = obduds_supported_dids(command, ex.response, responder)
+                    supported.update(announced)
+                    next_base = base + 0x20
+                    if next_base not in announced:
+                        break
+                    base = next_base
+
+                data_dids = sorted(did for did in supported if did & 0x1F)
+                print(
+                    f"[obduds {responder}] supported data DIDs: "
+                    f"{' '.join(f'{did:04X}' for did in data_dids) or '-'}"
+                )
+                if support_only:
+                    continue
+                if len(data_dids) > OBDUDS_MAX_DATA_DIDS:
+                    raise ProbeAbortedError(
+                        f"{responder} announced {len(data_dids)} DIDs; "
+                        f"limit is {OBDUDS_MAX_DATA_DIDS}"
+                    )
+                for did in data_dids:
+                    await execute(f"22{did:04X}", f"obduds-data-{ecu}", responder)
+        except ProbeAbortedError as error:
+            print(f"OBDonUDS probe aborted: {error}", file=sys.stderr)
+            result = 2
+        finally:
+            if link.session.usable:
+                for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                    ex = await link.session.run(cmd, check_obduds_allowed)
+                    link.record(ex, "obduds-cleanup")
     print(f"log: {log_path}")
     return result
 
@@ -1031,77 +1016,49 @@ async def identify(
     """Discover regulated 29-bit OBDonUDS ECUs, then read only each one's spare part
     number, software version, hardware number, and system name (never the serial
     number or any VIN) via check_identify_allowed."""
-    from bleak import BleakClient
-
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = out_dir / f"didscout_{stamp}_{label}_identify.jsonl"
     result = 0
 
-    async with BleakClient(address, timeout=20.0) as client:
-        if pair:
-            await client.pair()
-        chunk = max(20, client.mtu_size - 3)
-        write_char = client.services.get_characteristic(UART_WRITE)
-        if write_char is None:
-            print("UART write characteristic not found - wrong device?", file=sys.stderr)
+    async with connect_adapter(address, pair, log_path, label, frozenset({"ATDPN"})) as link:
+        if link is None:
             return 2
-        with_response = "write-without-response" not in write_char.properties
-        session = ElmSession(
-            lambda data: client.write_gatt_char(write_char, data, response=with_response), chunk
-        )
-        await client.start_notify(UART_NOTIFY, lambda _c, data: session.on_notify(bytes(data)))
 
-        with log_path.open("a", encoding="utf-8") as log:
+        async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
+            return await link.execute(command, stage, check_identify_allowed, responder)
 
-            def record(ex: Exchange, stage: str) -> None:
-                entry = {"stage": stage, "state": label, "mtu": client.mtu_size, **ex.__dict__}
-                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                log.flush()
-                first = ex.response.splitlines()[0] if ex.response else ""
-                status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
-                print(f"{status}  {first[:60]}")
-
-            async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
-                ex = await session.run(command, check_identify_allowed, responder)
-                record(ex, stage)
-                critical = command.startswith("AT") and command != "ATDPN"
-                if not session.usable or (critical and ex.status != "OK"):
-                    raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
-                return ex
-
-            try:
-                for cmd in ADAPTER_SETUP:
-                    await execute(cmd, "identify-setup")
-                responders = await obduds_discover(execute)
-                print(f"[identify] regulated responders: {' '.join(responders) or '-'}")
-                if not responders:
-                    result = 2
-
-                for responder in responders:
-                    ecu = await obduds_select_responder(execute, responder, "identify-setup")
-                    summary: list[str] = []
-                    for did in sorted(IDENTIFY_DIDS):
-                        command = f"22{did}"
-                        ex = await execute(command, f"identify-{ecu}", responder)
-                        if did == "F197" and ex.status == "OK":
-                            payload = decode_positive_payload(command, ex.response, responder)
-                            value = (
-                                payload.decode("ascii", errors="replace") if payload else ex.status
-                            )
-                        else:
-                            value = ex.status
-                        summary.append(f"{did}={value}")
-                    print(f"[identify {responder}] " + " ".join(summary))
-            except ProbeAbortedError as error:
-                print(f"identify aborted: {error}", file=sys.stderr)
+        try:
+            for cmd in ADAPTER_SETUP:
+                await execute(cmd, "identify-setup")
+            responders = await obduds_discover(execute)
+            print(f"[identify] regulated responders: {' '.join(responders) or '-'}")
+            if not responders:
                 result = 2
-            finally:
-                if session.usable:
-                    for cmd in ("ATFCSM0", "ATAR", "ATD"):
-                        ex = await session.run(cmd, check_identify_allowed)
-                        record(ex, "identify-cleanup")
-                await client.stop_notify(UART_NOTIFY)
+
+            for responder in responders:
+                ecu = await obduds_select_responder(execute, responder, "identify-setup")
+                summary: list[str] = []
+                for did in sorted(IDENTIFY_DIDS):
+                    command = f"22{did}"
+                    ex = await execute(command, f"identify-{ecu}", responder)
+                    if did == "F197" and ex.status == "OK":
+                        payload = decode_positive_payload(command, ex.response, responder)
+                        value = (
+                            payload.decode("ascii", errors="replace") if payload else ex.status
+                        )
+                    else:
+                        value = ex.status
+                    summary.append(f"{did}={value}")
+                print(f"[identify {responder}] " + " ".join(summary))
+        except ProbeAbortedError as error:
+            print(f"identify aborted: {error}", file=sys.stderr)
+            result = 2
+        finally:
+            if link.session.usable:
+                for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                    ex = await link.session.run(cmd, check_identify_allowed)
+                    link.record(ex, "identify-cleanup")
     print(f"log: {log_path}")
     return result
 
@@ -1120,125 +1077,104 @@ async def run_session(
     its neighbourhood, tyres + their neighbourhood, cluster odometer), then an
     indefinite WATCH_PLAN poll that only stops on Ctrl-C - so the whole trip ends
     up in one log file instead of several `probe`/`sweep` runs."""
-    from bleak import BleakClient
-
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = out_dir / f"didscout_{stamp}_{label}.jsonl"
     cancelled = False
 
-    async with BleakClient(address, timeout=20.0) as client:
-        if pair:
-            await client.pair()
-        chunk = max(20, client.mtu_size - 3)
-        write_char = client.services.get_characteristic(UART_WRITE)
-        if write_char is None:
-            print("UART write characteristic not found - wrong device?", file=sys.stderr)
+    async with connect_adapter(address, pair, log_path, label) as link:
+        if link is None:
             return 2
-        with_response = "write-without-response" not in write_char.properties
-        session = ElmSession(
-            lambda data: client.write_gatt_char(write_char, data, response=with_response), chunk
+        session = link.session
+        record = link.record
+
+        note_reader = start_note_reader(record)
+
+        for cmd in ADAPTER_SETUP:
+            record(await session.run(cmd), "setup")
+        for cmd in ("ATI", "STI", "STDI", "ATRV"):
+            record(await session.run(cmd), "A")
+        record(await session.run(FORCE_PROTOCOL[protocol] if protocol else "ATSP0"), "B")
+        record(await session.run("0100"), "B")
+        record(await session.run("ATDPN"), "B")
+
+        bitmaps: list[str] = []
+        for cmd in STAGES["C"]:
+            ex = await session.run(cmd)
+            record(ex, "C")
+            bitmaps.append(ex.response)
+        supported = supported_pids(bitmaps)
+        print(f"[C] supported mode-01 PIDs: {' '.join(sorted(supported)) or '-'}")
+        for pid, cmd in STAGE_C_CANDIDATES.items():
+            if pid in supported:
+                record(await session.run(cmd), "C")
+
+        for cmd in STAGE_E_GATEWAY:
+            record(await session.run(cmd), "E")
+        start_i, end_i = SESSION_SWEEP_RANGES["710"]
+        await sweep_range(session, record, start_i, end_i, "sweep-710", "77A")
+
+        record(await session.run("ATSH70B"), "E")
+        record(await session.run("ATCRA775"), "E")
+        record(await session.run("ATFCSH70B"), "E")
+        for cmd in ("2218A0", "2218A1", "2218A2", "2218A3"):
+            record(await session.run(cmd), "E")
+        start_i, end_i = SESSION_SWEEP_RANGES["70B"]
+        await sweep_range(session, record, start_i, end_i, "sweep-70B", "775")
+        record(await session.run("ATFCSM0"), "E")
+        record(await session.run("ATAR"), "E")
+        record(await session.run("ATSH714"), "E")
+        record(await session.run("222203"), "E")
+
+        # Keep ATE0/ATL0/ATS0/ATH1 intact. ATD here used to reset those settings
+        # and switched watch replies into ELM's numbered assembled format.
+        for cmd in ("ATSH710", "ATCRA77A", "ATFCSH710", "ATFCSD300000", "ATFCSM1"):
+            record(await session.run(cmd), "E")
+
+        print()
+        print(
+            "Now type and Enter: state of charge, odometer, outside temperature, "
+            "battery temperature - then drive. Keeps running in the background, "
+            "press Ctrl-C after the drive home to stop."
         )
-        await client.start_notify(UART_NOTIFY, lambda _c, data: session.on_notify(bytes(data)))
+        print()
 
-        with log_path.open("a", encoding="utf-8") as log:
-
-            def record(ex: Exchange, stage: str) -> None:
-                entry = {"stage": stage, "state": label, "mtu": client.mtu_size, **ex.__dict__}
-                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                log.flush()
-                first = ex.response.splitlines()[0] if ex.response else ""
-                status = f"[{stage}] {ex.command:<14} {ex.status:<32} {ex.duration_ms:7.1f} ms"
-                print(f"{status}  {first[:60]}")
-
-            note_reader = start_note_reader(record)
-
-            for cmd in ADAPTER_SETUP:
-                record(await session.run(cmd), "setup")
-            for cmd in ("ATI", "STI", "STDI", "ATRV"):
-                record(await session.run(cmd), "A")
-            record(await session.run(FORCE_PROTOCOL[protocol] if protocol else "ATSP0"), "B")
-            record(await session.run("0100"), "B")
-            record(await session.run("ATDPN"), "B")
-
-            bitmaps: list[str] = []
-            for cmd in STAGES["C"]:
-                ex = await session.run(cmd)
-                record(ex, "C")
-                bitmaps.append(ex.response)
-            supported = supported_pids(bitmaps)
-            print(f"[C] supported mode-01 PIDs: {' '.join(sorted(supported)) or '-'}")
-            for pid, cmd in STAGE_C_CANDIDATES.items():
-                if pid in supported:
-                    record(await session.run(cmd), "C")
-
-            for cmd in STAGE_E_GATEWAY:
-                record(await session.run(cmd), "E")
-            start_i, end_i = SESSION_SWEEP_RANGES["710"]
-            await sweep_range(session, record, start_i, end_i, "sweep-710", "77A")
-
-            record(await session.run("ATSH70B"), "E")
-            record(await session.run("ATCRA775"), "E")
-            record(await session.run("ATFCSH70B"), "E")
-            for cmd in ("2218A0", "2218A1", "2218A2", "2218A3"):
-                record(await session.run(cmd), "E")
-            start_i, end_i = SESSION_SWEEP_RANGES["70B"]
-            await sweep_range(session, record, start_i, end_i, "sweep-70B", "775")
-            record(await session.run("ATFCSM0"), "E")
-            record(await session.run("ATAR"), "E")
-            record(await session.run("ATSH714"), "E")
-            record(await session.run("222203"), "E")
-
-            # Keep ATE0/ATL0/ATS0/ATH1 intact. ATD here used to reset those settings
-            # and switched watch replies into ELM's numbered assembled format.
-            for cmd in ("ATSH710", "ATCRA77A", "ATFCSH710", "ATFCSD300000", "ATFCSM1"):
-                record(await session.run(cmd), "E")
-
-            print()
-            print(
-                "Now type and Enter: state of charge, odometer, outside temperature, "
-                "battery temperature - then drive. Keeps running in the background, "
-                "press Ctrl-C after the drive home to stop."
+        intervals = watch_schedule(survey, survey_interval)
+        latest: dict[str, LiveValue] = {}
+        next_due = dict.fromkeys(intervals, time.monotonic())
+        try:
+            while True:
+                now = time.monotonic()
+                due = _due_commands(next_due, now)
+                if not due:
+                    await asyncio.sleep(min(1.0, min(next_due.values()) - now))
+                    continue
+                for cmd in due:
+                    ex = await session.run(cmd)
+                    record(ex, "E-survey" if cmd in GATEWAY_SURVEY else "E-watch")
+                    latest[cmd] = LiveValue(ex.response, ex.status, time.monotonic())
+                    next_due[cmd] = time.monotonic() + intervals[cmd]
+                print(format_live_summary(latest))
+        except asyncio.CancelledError:
+            cancelled = True
+            print("\n[session] Ctrl-C detected, shutting down cleanly...")
+        finally:
+            end_status = "CANCELLED" if cancelled else "COMPLETE"
+            record(
+                Exchange(
+                    "SESSION_END",
+                    "Ctrl-C" if cancelled else "watch ended",
+                    end_status,
+                    datetime.now(UTC).isoformat(),
+                    0.0,
+                ),
+                "session",
             )
-            print()
-
-            intervals = watch_schedule(survey, survey_interval)
-            latest: dict[str, LiveValue] = {}
-            next_due = dict.fromkeys(intervals, time.monotonic())
-            try:
-                while True:
-                    now = time.monotonic()
-                    due = _due_commands(next_due, now)
-                    if not due:
-                        await asyncio.sleep(min(1.0, min(next_due.values()) - now))
-                        continue
-                    for cmd in due:
-                        ex = await session.run(cmd)
-                        record(ex, "E-survey" if cmd in GATEWAY_SURVEY else "E-watch")
-                        latest[cmd] = LiveValue(ex.response, ex.status, time.monotonic())
-                        next_due[cmd] = time.monotonic() + intervals[cmd]
-                    print(format_live_summary(latest))
-            except asyncio.CancelledError:
-                cancelled = True
-                print("\n[session] Ctrl-C detected, shutting down cleanly...")
-            finally:
-                end_status = "CANCELLED" if cancelled else "COMPLETE"
-                record(
-                    Exchange(
-                        "SESSION_END",
-                        "Ctrl-C" if cancelled else "watch ended",
-                        end_status,
-                        datetime.now(UTC).isoformat(),
-                        0.0,
-                    ),
-                    "session",
-                )
-                for cmd in ("ATFCSM0", "ATAR", "ATD"):
-                    if not session.usable:
-                        break
-                    record(await session.run(cmd), "cleanup")
-                await note_reader.stop()
-        await client.stop_notify(UART_NOTIFY)
+            for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                if not session.usable:
+                    break
+                record(await session.run(cmd), "cleanup")
+            await note_reader.stop()
     print(f"log: {log_path}")
     return 130 if cancelled else 0
 

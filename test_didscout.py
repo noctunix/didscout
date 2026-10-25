@@ -1509,8 +1509,17 @@ def test_record_resumes_unfinished_run_and_new_flag_starts_fresh(
 
         return stage
 
+    async def fake_run_record_loop(
+        _link: object, _state: object, _profile: object, _state_path: object
+    ) -> None:
+        # The inventory is what this test cares about; the continuous loop
+        # that follows it is exercised separately (see
+        # test_record_loop_discovers_while_stationary_and_pauses_while_moving).
+        raise asyncio.CancelledError
+
     fakes = {name: make_stage(name) for name in cx.INVENTORY_STAGE_ORDER}
     monkeypatch.setattr(cx, "INVENTORY_STAGE_FUNCS", fakes)
+    monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
     monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
 
     existing = _write_run(tmp_path, "20260101_000000", "vehicle", finished=False)
@@ -1519,13 +1528,15 @@ def test_record_resumes_unfinished_run_and_new_flag_starts_fresh(
     state.save(existing / "state.json")
 
     result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False))
-    assert result == 0
+    assert result == 130
     assert calls == ["protocol", "mode01", "obduds", "ecus11"]
-    assert cx.RunState.load(existing / "state.json").finished is True
+    # finished stays False: a `record` run never ends on its own, only on
+    # Ctrl-C, so the next start resumes the continuous loop, not the inventory.
+    assert cx.RunState.load(existing / "state.json").finished is False
 
     calls.clear()
     result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, True))
-    assert result == 0
+    assert result == 130
     assert calls == list(cx.INVENTORY_STAGE_ORDER)
     assert len(list(tmp_path.glob("record_*"))) == 2
 
@@ -1573,11 +1584,18 @@ def test_record_reconnects_after_transport_error_and_resumes_interrupted_stage(
             "ecus11": fake_ecus11,
         },
     )
+
+    async def fake_run_record_loop(
+        _link: object, _state: object, _profile: object, _state_path: object
+    ) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
     monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
 
     result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False))
 
-    assert result == 0
+    assert result == 130
     # adapter must not be redone on the reconnect - only the interrupted stage is retried.
     assert calls == ["adapter", "protocol", "protocol", "mode01", "obduds", "ecus11"]
 
@@ -1625,17 +1643,24 @@ def test_record_marks_stage_failed_after_three_consecutive_failures(
             "ecus11": fake_ecus11,
         },
     )
+
+    async def fake_run_record_loop(
+        _link: object, _state: object, _profile: object, _state_path: object
+    ) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
     monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
 
     result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False))
 
-    assert result == 0
+    assert result == 130
     assert attempts["n"] == 3
     run_dir = next(tmp_path.glob("record_*"))
     state = cx.RunState.load(run_dir / "state.json")
     assert state.stage_status("protocol") == "failed"
     assert state.stage_status("mode01") == "done"
-    assert state.finished is True
+    assert state.finished is False
 
 
 def test_ecus11_discovery_finds_positive_and_negative_responders_and_ignores_silence(
@@ -1679,3 +1704,169 @@ def test_ecus11_discovery_finds_positive_and_negative_responders_and_ignores_sil
     assert ecus["710"]["identify"]["F189"] == "OK"
     assert ecus["705"]["response"] == "745"
     assert ecus["705"]["identify"]["F189"].startswith("NRC")
+
+
+def test_stretch_watch_intervals_keeps_speed_and_scales_the_rest() -> None:
+    entries = [("speed", 2.0, True), ("a", 1.0, False), ("b", 1.0, False)]
+    # rate = 1/1 + 1/1 = 2.0 reads/s; stretched by 2x to fit a 1.0 limit.
+    stretched = cx.stretch_watch_intervals(entries, limit=1.0)
+    assert stretched["speed"] == 2.0
+    assert stretched["a"] == pytest.approx(2.0)
+    assert stretched["b"] == pytest.approx(2.0)
+
+    under_limit = cx.stretch_watch_intervals([("a", 10.0, False)], limit=cx.RECORD_LOAD_LIMIT)
+    assert under_limit["a"] == 10.0
+
+
+def test_discovery_did_order_profile_ranges_first_then_priority_then_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cx, "DISCOVERY_PRIORITY_RANGES", ((0x0100, 0x0101),))
+    monkeypatch.setattr(cx, "DISCOVERY_FULL_RANGE", (0x0000, 0x0003))
+    order = cx.discovery_did_order([(0x0002, 0x0002)])
+    assert order == [0x0002, 0x0100, 0x0101, 0x0000, 0x0001, 0x0003]
+
+
+def test_discovery_did_order_excludes_vin_serial_and_standardized_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cx, "DISCOVERY_PRIORITY_RANGES", ())
+    monkeypatch.setattr(cx, "DISCOVERY_FULL_RANGE", (0x0000, 0x0000))
+    order = cx.discovery_did_order([(0xF18B, 0xF18E), (0xF190, 0xF190), (0xF802, 0xF802)])
+    assert 0xF18C not in order  # serial number
+    assert 0xF190 not in order  # VIN
+    assert 0xF802 not in order  # OBDonUDS VIN
+    assert order == [0xF18B, 0xF18D, 0xF18E, 0x0000]
+
+    monkeypatch.setattr(cx, "DISCOVERY_FULL_RANGE", (0xF400, 0xF810))
+    order = cx.discovery_did_order([])
+    assert all(did < 0xF400 or did > 0xF5FF for did in order)
+    assert all(did < 0xF800 or did > 0xF8FF for did in order)
+
+
+def test_build_record_modules_resumes_discovery_position_from_state() -> None:
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": [], "chosen": None})
+    state.set_result("ecus11", {"710": {"response": "77A", "identify": {}}})
+    state.save_discovery_state("ecus11:710", 3, ["1004"], ["1005"])
+
+    modules = cx.build_record_modules(None, state)
+    module = modules["ecus11:710"]
+    assert module.position == 3
+    assert module.discovered == {0x1004}
+    assert module.conditional == {0x1005}
+
+
+def test_motion_phase_rules() -> None:
+    assert cx.motion_phase(None, None) == "moving"  # no speed source
+    assert cx.motion_phase(None, 1.0) == "moving"  # last speed read failed
+    assert cx.motion_phase(0, cx.RECORD_SPEED_MAX_AGE + 1) == "moving"  # stale
+    assert cx.motion_phase(0, cx.RECORD_SPEED_MAX_AGE) == "stationary"  # fresh at the edge
+    assert cx.motion_phase(0, 0.0) == "stationary"
+    assert cx.motion_phase(5, 0.0) == "moving"
+
+
+def test_decode_speed_from_mode01_and_obduds() -> None:
+    mode01_ex = cx.Exchange("010D", "7E803410D1E", "OK", "", 0.0)
+    assert cx.decode_speed("010D", mode01_ex, None) == 0x1E
+
+    obduds_ex = cx.Exchange("22F40D", "18DAF1A00462F40D1E", "OK", "", 0.0)
+    assert cx.decode_speed("22F40D", obduds_ex, "18DAF1A0") == 0x1E
+
+    failed_ex = cx.Exchange("010D", "NO DATA", "NO DATA", "", 0.0)
+    assert cx.decode_speed("010D", failed_ex, None) is None
+
+
+def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_conditional(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "DISCOVERY_PRIORITY_RANGES", ())
+    monkeypatch.setattr(cx, "DISCOVERY_FULL_RANGE", (0x1000, 0x100B))
+    monkeypatch.setattr(cx, "RECORD_DISCOVERY_BATCH", 2)
+    # Large enough that it never elapses on its own during this test - speed
+    # reads are instead forced on demand by setting next_due directly, so the
+    # test doesn't race a real interval against fake-transport command overhead.
+    monkeypatch.setattr(cx, "RECORD_SPEED_INTERVAL", 60.0)
+
+    kmh = {"value": 0}
+    did1005_attempts = {"n": 0}
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd == "ATZ":
+            return b"ELM327 v1.4\r>"
+        if cmd == "010D":
+            return hex_reply("7E8", bytes([0x41, 0x0D, kmh["value"]]))
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if cmd == "221004":
+            return hex_reply("77A", bytes([0x62, 0x10, 0x04, 0xAA]))
+        if cmd == "221005":
+            did1005_attempts["n"] += 1
+            if did1005_attempts["n"] == 1:
+                return hex_reply("77A", bytes([0x7F, 0x22, 0x22]))
+            return hex_reply("77A", bytes([0x62, 0x10, 0x05, 0xAA]))
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": ["6"], "chosen": "6"})
+    state.set_result("mode01", {"supported_pids": ["0D"]})
+    state.set_result("ecus11", {"710": {"response": "77A", "identify": {}}})
+    state.set_result("obduds", {})
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            loop_state = cx.build_record_loop_state(None, state)
+
+            # Stationary from the start: one tick reads speed, then the next
+            # batches cover 0x1000-0x1007, including 0x1004 (OK) and 0x1005
+            # (conditionsNotCorrect) together in the third batch.
+            for _ in range(6):
+                await cx.record_loop_tick(link, state, state_path, loop_state)
+
+            position, discovered, conditional = state.discovery_state("ecus11:710")
+            assert position == 8
+            assert discovered == ["1004"]
+            assert conditional == ["1005"]
+            assert ("ecus11:710", "221004") in loop_state.by_key
+
+            speed_key = ("mode01", "010D")
+
+            # Moving: discovery must pause, position stays put. The speed read
+            # is forced due right away rather than waiting out a real interval.
+            kmh["value"] = 30
+            loop_state.next_due[speed_key] = time.monotonic()
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            assert loop_state.phase == "moving"
+            position, _, _ = state.discovery_state("ecus11:710")
+            assert position == 8
+
+            # Stationary again: the phase change retries the conditional DID,
+            # which now succeeds, before discovery resumes at its old position.
+            kmh["value"] = 0
+            loop_state.next_due[speed_key] = time.monotonic()
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            assert loop_state.phase == "stationary"
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            position, discovered, conditional = state.discovery_state("ecus11:710")
+            assert discovered == ["1004", "1005"]
+            assert conditional == []
+            assert position == 8  # the retry only drained the conditional queue
+
+            for _ in range(4):
+                await cx.record_loop_tick(link, state, state_path, loop_state)
+            position, discovered, conditional = state.discovery_state("ecus11:710")
+            assert position == 12
+            assert discovered == ["1004", "1005"]
+            assert conditional == []
+
+    asyncio.run(scenario())
+    assert state.finished is False

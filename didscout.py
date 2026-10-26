@@ -2450,10 +2450,22 @@ def build_record_watch(
 
     obduds = state.result("obduds") or {}
     if isinstance(obduds, dict):
-        for responder, info in obduds.items():
+        # Every regulated OBDonUDS ECU reports the same standardized DIDs -
+        # watch each one from only the first (lowest-address) responder that
+        # announces it; the rest already got it once during the inventory
+        # (`_inventory_obduds`'s own data-DID pass), see "Watch standardized
+        # OBDonUDS DIDs once".
+        did_owner: dict[str, str] = {}
+        for responder, info in sorted(obduds.items()):
+            assert isinstance(info, dict)
+            for did in info.get("supported_dids", []):
+                did_owner.setdefault(did, responder)
+        for responder, info in sorted(obduds.items()):
             assert isinstance(info, dict)
             module_key = f"obduds:{responder}"
             for did in info.get("supported_dids", []):
+                if did_owner[did] != responder:
+                    continue
                 command = f"22{did}"
                 if speed_key == (module_key, command):
                     continue

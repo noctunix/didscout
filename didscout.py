@@ -3191,6 +3191,46 @@ def _entry_seconds(entry: dict[str, object], origin: datetime | None) -> float:
     return (datetime.fromisoformat(ts) - origin).total_seconds()
 
 
+_HEADERLESS_NUMBERED_LINE = re.compile(r"^([0-9A-F]):([0-9A-F]+)$")
+
+
+def _decode_headerless_payload(command: str, response: str) -> bytes | None:
+    """`derive`-only fallback for a positive ReadDataByIdentifier reply that
+    lost CAN headers and ISO-TP framing mid-run (adapter reverted to
+    headers-off formatting - see record's FORMAT_LOST recovery, which
+    prevents this going forward but can't fix an already-captured log): a
+    bare single-frame hex line, or ELM's numbered multi-frame continuation
+    lines ("0: 62 2A B8 00 00 06", "1: 58 00 00 ...", concatenated in index
+    order). Returns the data bytes after the ReadDataByIdentifier echo if
+    the prefix matches, else None - never used by `record` itself, which
+    always has real CAN headers to validate a reply against."""
+    expected = bytes.fromhex(command)
+    prefix = bytes([expected[0] + 0x40]) + expected[1:]
+    lines = [re.sub(r"\s+", "", line.upper()) for line in response.splitlines()]
+    lines = [line for line in lines if line and line != command]
+
+    numbered: dict[int, str] = {}
+    plain: list[str] = []
+    for line in lines:
+        match = _HEADERLESS_NUMBERED_LINE.fullmatch(line)
+        if match:
+            numbered[int(match.group(1), 16)] = match.group(2)
+        elif re.fullmatch(r"[0-9A-F]+", line):
+            plain.append(line)
+
+    if numbered:
+        data = bytes.fromhex("".join(numbered[i] for i in sorted(numbered)))
+        return data[len(prefix) :] if data.startswith(prefix) else None
+
+    for line in plain:
+        if len(line) % 2:
+            continue
+        data = bytes.fromhex(line)
+        if data.startswith(prefix):
+            return data[len(prefix) :]
+    return None
+
+
 def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
     """Replays a capture log in order, grouping every ReadDataByIdentifier
     exchange by the CAN header pair active at the time (tracked from the
@@ -3242,10 +3282,19 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
                 notes.append(NoteSample(t, note_key, note_value))
             continue
 
-        if command in SPEED_COMMANDS and status == "OK":
-            speed = decode_speed(
-                command, Exchange(command, response_raw, status, "", 0.0), current_response
-            )
+        has_module = entry.get("module") is not None
+        if command in SPEED_COMMANDS:
+            speed: int | None = None
+            if status == "OK":
+                speed = decode_speed(
+                    command, Exchange(command, response_raw, status, "", 0.0), current_response
+                )
+            elif has_module and command != "010D":
+                # A lost-formatting capture (see FORMAT_LOST) misclassified
+                # this as MALFORMED - try the headerless fallback instead of
+                # treating motion as unknown for the whole run.
+                payload = _decode_headerless_payload(command, response_raw)
+                speed = payload[0] if payload else None
             if speed is not None:
                 speed_series.append((t, speed))
 
@@ -3263,9 +3312,13 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
         if status in CONDITIONAL_STATUSES:
             record.conditional = True
             continue
-        if status != "OK":
-            continue
-        payload = decode_positive_payload(command, response_raw, current_response)
+        payload = None
+        if status == "OK":
+            payload = decode_positive_payload(command, response_raw, current_response)
+        elif has_module:
+            # Same lost-formatting fallback as above, for a data DID rather
+            # than the speed source.
+            payload = _decode_headerless_payload(command, response_raw)
         if payload:
             record.samples.append(DidSample(t, payload, current_phase))
 

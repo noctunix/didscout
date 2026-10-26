@@ -2788,6 +2788,42 @@ def test_derive_writes_nothing_when_no_dids_were_discovered(tmp_path: Path) -> N
     assert report_path.exists()
 
 
+def test_analyze_capture_decodes_headerless_entries_with_module() -> None:
+    # Lost adapter formatting (see FORMAT_LOST) made these MALFORMED at
+    # record time: no CAN header, no ISO-TP framing nibble - a bare single
+    # frame, or ELM's numbered multi-frame continuation lines. `derive`
+    # still recovers them as long as the entry carries a `module` field.
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH710", "OK", "OK"),
+        _capture_entry(base, 0.5, "record-setup", "ATCRA77A", "OK", "OK"),
+        _capture_entry(
+            base, 1, "watch", "222A50", "MALFORMED", "222A50\r62 2A 50 7B", "profile:gateway"
+        ),
+        _capture_entry(
+            base,
+            2,
+            "watch",
+            "222A60",
+            "MALFORMED",
+            "222A60\r00B \r0: 62 2A 60 00 00 06 \r1: 58 00 00 ",
+            "profile:gateway",
+        ),
+        # Same shape, but no `module` field - never guessed at, stays MALFORMED.
+        _capture_entry(base, 3, "watch", "222A70", "MALFORMED", "222A70\r62 2A 70 09"),
+        # The speed source lost formatting too, but still has a module.
+        _capture_entry(
+            base, 4, "watch", "22F40D", "MALFORMED", "22F40D\r62 F4 0D 32", "obduds:18DAF112"
+        ),
+    ]
+    data = cx.analyze_capture(entries)
+    module = data.modules[("710", "77A")]
+    assert module.dids["2A50"].samples[0].payload == bytes([0x7B])
+    assert module.dids["2A60"].samples[0].payload == bytes([0x00, 0x00, 0x06, 0x58, 0x00, 0x00])
+    assert module.dids["2A70"].samples == []
+    assert data.speed_series == [(4.0, 0x32)]
+
+
 def test_derive_rejects_capture_path_directly(tmp_path: Path) -> None:
     base = datetime(2026, 10, 25, tzinfo=UTC)
     run_dir = tmp_path / "record_test"

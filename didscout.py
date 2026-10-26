@@ -1098,6 +1098,35 @@ class ProbeAbortedError(Exception):
     pass
 
 
+# A 01xx/22xx reply line that still carries a recognizable CAN header - either
+# an 11-bit id or a 29-bit OBDonUDS request/response pair.
+CAN_HEADER_LINE = re.compile(r"^(?:[0-9A-F]{3}|18DA[0-9A-F]{2}F1|18DAF1[0-9A-F]{2})[0-9A-F]")
+NON_DATA_RESPONSES = frozenset(
+    {"NODATA", "CANERROR", "BUSINIT", "UNABLETOCONNECT", "BUFFERFULL", "STOPPED", "?"}
+)
+
+
+def detect_format_lost(command: str, response: str) -> bool:
+    """True if `response` shows the adapter reverted to echo-on/headers-off
+    formatting mid-run - e.g. after an ATD a stage's own cleanup should never
+    have sent: its first line echoes `command` back, or - for a 01xx/22xx
+    data read that got some reply - no line carries a recognizable CAN
+    header, meaning ATH1 is no longer in effect. Used only by `record`, whose
+    long-running inventory/watch/discovery reads need the adapter's
+    formatting to stay put for the whole run (see `AdapterLink.execute_guarded`)."""
+    lines = [line.strip() for line in response.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if normalize(lines[0]) == normalize(command):
+        return True
+    if not command.startswith(("01", "22")):
+        return False
+    flat_lines = [re.sub(r"\s+", "", line.upper()) for line in lines]
+    if any(flat in NON_DATA_RESPONSES for flat in flat_lines):
+        return False
+    return not any(CAN_HEADER_LINE.match(flat) for flat in flat_lines)
+
+
 # AT commands whose non-OK reply doesn't abort a probe: informational banners/
 # voltage/protocol-name queries, and ATMA, which never replies OK.
 DEFAULT_NON_CRITICAL_AT = frozenset({"ATI", "ATRV", "ATDPN", "ATMA"})
@@ -1144,6 +1173,35 @@ class AdapterLink:
         critical = command.startswith("AT") and command not in self.non_critical_at
         if not self.session.usable or (critical and ex.status != "OK"):
             raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
+        return ex
+
+    async def execute_guarded(
+        self,
+        command: str,
+        stage: str,
+        validator: Callable[[str], str] = check_allowed,
+        responder: str | None = None,
+        module: str | None = None,
+        log: bool = True,
+    ) -> Exchange:
+        """`execute`, but for `record`'s own inventory/watch/discovery reads:
+        detects the adapter having silently reverted to echo-on/headers-off
+        formatting (`detect_format_lost`), logs that as `FORMAT_LOST`,
+        re-asserts ATE0/ATL0/ATS0/ATH1 once, and retries the read once before
+        returning whatever that retry got, logged (or not) like a normal
+        `execute` call."""
+        ex = await self.execute(command, stage, validator, responder, module, log=False)
+        if detect_format_lost(command, ex.response):
+            self.record(
+                Exchange(command, ex.response, "FORMAT_LOST", ex.started_utc, ex.duration_ms),
+                stage,
+                module,
+            )
+            for cmd in ("ATE0", "ATL0", "ATS0", "ATH1"):
+                await self.execute(cmd, f"{stage}-format-recover", validator, None, module)
+            ex = await self.execute(command, stage, validator, responder, module, log=False)
+        if log:
+            self.record(ex, stage, module)
         return ex
 
 
@@ -1808,7 +1866,7 @@ async def _inventory_protocol(link: AdapterLink, state: RunState, profile: Profi
     answered: list[str] = []
     for proto, cmd in (("6", "ATSP6"), ("7", "ATSP7")):
         await link.execute(cmd, "protocol")
-        ex = await link.execute("0100", "protocol")
+        ex = await link.execute_guarded("0100", "protocol")
         await link.execute("ATDPN", "protocol")
         if ex.status == "OK":
             answered.append(proto)
@@ -1840,7 +1898,7 @@ async def _inventory_mode01(link: AdapterLink, state: RunState, _profile: Profil
 
     bitmaps: list[str] = []
     for index, base in enumerate(MODE01_BITMAP_BASES):
-        ex = await link.execute(f"01{base}", "mode01", check_mode01_allowed)
+        ex = await link.execute_guarded(f"01{base}", "mode01", check_mode01_allowed)
         if ex.status != "OK":
             break
         bitmaps.append(ex.response)
@@ -1852,16 +1910,16 @@ async def _inventory_mode01(link: AdapterLink, state: RunState, _profile: Profil
 
     supported = sorted(supported_pids(bitmaps))
     for pid in supported:
-        await link.execute(f"01{pid}", "mode01", check_mode01_allowed)
+        await link.execute_guarded(f"01{pid}", "mode01", check_mode01_allowed)
     state.set_result("mode01", {"supported_pids": supported, "protocol": mode01_protocol})
 
 
 async def _inventory_obduds(link: AdapterLink, state: RunState, _profile: Profile | None) -> None:
     async def execute_obduds(command: str, stage: str, responder: str | None = None) -> Exchange:
-        return await link.execute(command, stage, check_obduds_allowed, responder)
+        return await link.execute_guarded(command, stage, check_obduds_allowed, responder)
 
     async def execute_identify(command: str, stage: str, responder: str | None = None) -> Exchange:
-        return await link.execute(command, stage, check_identify_allowed, responder)
+        return await link.execute_guarded(command, stage, check_identify_allowed, responder)
 
     responders = await obduds_discover(execute_obduds)
     results: dict[str, object] = {}
@@ -1882,7 +1940,6 @@ async def _inventory_obduds(link: AdapterLink, state: RunState, _profile: Profil
         }
         await execute_obduds("ATFCSM0", "obduds-cleanup", None)
     await execute_obduds("ATAR", "obduds-cleanup", None)
-    await execute_obduds("ATD", "obduds-cleanup", None)
     state.set_result("obduds", results)
 
 
@@ -1893,7 +1950,7 @@ ECU11_REQUEST_IDS = [request for request in range(0x700, 0x7F0) if request != 0x
 
 async def _inventory_ecus11(link: AdapterLink, state: RunState, profile: Profile | None) -> None:
     async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
-        return await link.execute(command, stage, check_ecus11_allowed, responder)
+        return await link.execute_guarded(command, stage, check_ecus11_allowed, responder)
 
     await execute("ATSP6", "ecus11-setup")
     await execute("ATDPN", "ecus11-setup")
@@ -2004,7 +2061,7 @@ async def _inventory_ecus29(link: AdapterLink, state: RunState, profile: Profile
     (see check_vag29_allowed) - also probes VAG's 17FC00xx/17FE00xx scheme."""
 
     async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
-        return await link.execute(command, stage, check_ecus29_allowed, responder)
+        return await link.execute_guarded(command, stage, check_ecus29_allowed, responder)
 
     await execute("ATSP7", "ecus29-setup")
     await execute("ATDPN", "ecus29-setup")
@@ -2033,7 +2090,7 @@ async def _inventory_ecus29(link: AdapterLink, state: RunState, profile: Profile
     if profile is not None and "vag-29bit" in profile.address_schemes:
 
         async def execute_vag(command: str, stage: str, responder: str | None = None) -> Exchange:
-            return await link.execute(command, stage, check_vag29_allowed, responder)
+            return await link.execute_guarded(command, stage, check_vag29_allowed, responder)
 
         await execute_vag("ATSP7", "ecus29-vag-setup")
         await execute_vag("ATDPN", "ecus29-vag-setup")
@@ -2435,7 +2492,7 @@ async def run_discovery_batch(
     newly_found: list[int] = []
     status_counts: dict[str, int] = {}
     for did in batch:
-        ex = await link.execute(
+        ex = await link.execute_guarded(
             f"22{did:04X}", stage, module.validator, module.responder, module=module.key, log=False
         )
         status_counts[ex.status] = status_counts.get(ex.status, 0) + 1
@@ -2634,10 +2691,10 @@ async def _record_rediscover(
     profile = loop_state.profile
 
     async def execute11(command: str, s: str, responder: str | None = None) -> Exchange:
-        return await link.execute(command, s, check_ecus11_allowed, responder)
+        return await link.execute_guarded(command, s, check_ecus11_allowed, responder)
 
     async def execute29(command: str, s: str, responder: str | None = None) -> Exchange:
-        return await link.execute(command, s, check_ecus29_allowed, responder)
+        return await link.execute_guarded(command, s, check_ecus29_allowed, responder)
 
     known_ecus11 = state.result("ecus11") or {}
     assert isinstance(known_ecus11, dict)
@@ -2698,7 +2755,7 @@ async def _record_rediscover(
     if profile is not None and "vag-29bit" in profile.address_schemes:
 
         async def execute_vag(command: str, s: str, responder: str | None = None) -> Exchange:
-            return await link.execute(command, s, check_vag29_allowed, responder)
+            return await link.execute_guarded(command, s, check_vag29_allowed, responder)
 
         known_vag29 = state.result("vag29") or {}
         assert isinstance(known_vag29, dict)
@@ -2771,7 +2828,7 @@ async def record_loop_tick(
             entry = loop_state.by_key[key]
             await _record_ensure_module(link, loop_state, entry.module_key)
             module = loop_state.modules[entry.module_key]
-            ex = await link.execute(
+            ex = await link.execute_guarded(
                 entry.command,
                 entry.stage,
                 module.validator,
@@ -3887,6 +3944,11 @@ async def record(
                             state.mark_stage(stage, "done")
                             state.save(state_path)
                             failures[stage] = 0
+                            # A stage's own cleanup may have left the adapter in an
+                            # unexpected formatting state (see FORMAT_LOST) - never
+                            # trust it across a stage boundary, reassert explicitly.
+                            for cmd in ("ATE0", "ATL0", "ATS0", "ATH1"):
+                                await link.execute(cmd, "setup")
                     else:
                         print_inventory_summary(state)
 
@@ -3903,7 +3965,7 @@ async def record(
                             ),
                             "session",
                         )
-                        for cmd in ("ATFCSM0", "ATAR", "ATD"):
+                        for cmd in ("ATFCSM0", "ATAR"):
                             if not link.session.usable:
                                 break
                             link.record(await link.session.run(cmd), "cleanup")

@@ -3428,7 +3428,8 @@ def _render_note_matches(matches: dict[str, list[NoteMatch]], notes: list[NoteSa
             suffix = f' - named "{key} candidate" in the draft' if named else ""
             lines.append(
                 f"- {m.label} / DID {m.did} / field (offset {m.offset}, width {m.width}, "
-                f"{signedness}): r={m.r:+.3f}, display ≈ {m.a:.4f}·raw + {m.b:+.4f}, "
+                f"{signedness}): r={m.r:+.3f}, "
+                f"display ≈ {m.a:.4f}·raw {'-' if m.b < 0 else '+'} {abs(m.b):.4f}, "
                 f"RMSE={m.rmse:.3f}, n={m.n}{suffix}"
             )
         lines.append("")

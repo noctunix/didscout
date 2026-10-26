@@ -2877,7 +2877,7 @@ def test_derive_matches_notes_to_raw_field_and_names_draft_did(tmp_path: Path) -
     assert "offset 0, width 2, unsigned" in first_match_line
     assert "r=+1.000" in first_match_line
     assert "0.1000·raw" in first_match_line
-    assert "-0.5000" in first_match_line
+    assert "raw - 0.5000" in first_match_line
     assert "n=4" in first_match_line
     assert "soc candidate" in first_match_line
 

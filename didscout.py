@@ -1099,33 +1099,21 @@ class ProbeAbortedError(Exception):
     pass
 
 
-# A 01xx/22xx reply line that still carries a recognizable CAN header - either
-# an 11-bit id or a 29-bit OBDonUDS request/response pair.
-CAN_HEADER_LINE = re.compile(r"^(?:[0-9A-F]{3}|18DA[0-9A-F]{2}F1|18DAF1[0-9A-F]{2})[0-9A-F]")
-NON_DATA_RESPONSES = frozenset(
-    {"NODATA", "CANERROR", "BUSINIT", "UNABLETOCONNECT", "BUFFERFULL", "STOPPED", "?"}
-)
-
-
-def detect_format_lost(command: str, response: str) -> bool:
-    """True if `response` shows the adapter reverted to echo-on/headers-off
-    formatting mid-run - e.g. after an ATD a stage's own cleanup should never
-    have sent: its first line echoes `command` back, or - for a 01xx/22xx
-    data read that got some reply - no line carries a recognizable CAN
-    header, meaning ATH1 is no longer in effect. Used only by `record`, whose
-    long-running inventory/watch/discovery reads need the adapter's
-    formatting to stay put for the whole run (see `AdapterLink.execute_guarded`)."""
+def detect_format_lost(command: str, status: str, response: str) -> bool:
+    """True if `response`/`status` show the adapter reverted to echo-on/
+    headers-off formatting mid-run - e.g. after an ATD a stage's own cleanup
+    should never have sent: its first line echoes `command` back, or - for a
+    01xx/22xx data read - `classify` already couldn't reassemble a header
+    and ISO-TP frame from it (`status == "MALFORMED"`; a header's first 3
+    (or, 29-bit, 8) hex digits can't otherwise be told apart from plain data
+    bytes, so this reuses `parse_isotp`'s own framing check rather than
+    re-guessing it from the text). Used only by `record`, whose long-running
+    inventory/watch/discovery reads need the adapter's formatting to stay put
+    for the whole run (see `AdapterLink.execute_guarded`)."""
     lines = [line.strip() for line in response.splitlines() if line.strip()]
-    if not lines:
-        return False
-    if normalize(lines[0]) == normalize(command):
+    if lines and normalize(lines[0]) == normalize(command):
         return True
-    if not command.startswith(("01", "22")):
-        return False
-    flat_lines = [re.sub(r"\s+", "", line.upper()) for line in lines]
-    if any(flat in NON_DATA_RESPONSES for flat in flat_lines):
-        return False
-    return not any(CAN_HEADER_LINE.match(flat) for flat in flat_lines)
+    return status == "MALFORMED" and command.startswith(("01", "22"))
 
 
 # AT commands whose non-OK reply doesn't abort a probe: informational banners/
@@ -1192,7 +1180,7 @@ class AdapterLink:
         returning whatever that retry got, logged (or not) like a normal
         `execute` call."""
         ex = await self.execute(command, stage, validator, responder, module, log=False)
-        if detect_format_lost(command, ex.response):
+        if detect_format_lost(command, ex.status, ex.response):
             self.record(
                 Exchange(command, ex.response, "FORMAT_LOST", ex.started_utc, ex.duration_ms),
                 stage,

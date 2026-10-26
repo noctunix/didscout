@@ -4,6 +4,7 @@ name = "VAG PPE platform"
 description = "Gateway and tyre-pressure module header/DID candidates for VAG's PPE platform."
 protocol = "6"
 vehicles = ["Audi A6 Avant e-tron (tested)"]
+address_schemes = ["vag-29bit"]
 
 [[sources]]
 title = "OBDb Porsche Macan Electric"

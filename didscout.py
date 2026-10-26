@@ -250,6 +250,47 @@ def check_ecus11_allowed(command: str) -> str:
     raise ForbiddenCommandError(cmd)
 
 
+def check_ecus29_allowed(command: str) -> str:
+    """For `record`'s 29-bit normal-fixed-addressing ECU inventory (ISO
+    15765-4, protocol 7): adapter/protocol setup, 18DAxxF1 request/18DAF1xx
+    response header/flow-control setup at any target, and the same four
+    identification reads as check_identify_allowed - never the serial number
+    or any VIN DID."""
+    cmd = normalize(command)
+    base = {*ADAPTER_SETUP, "ATSP7", "ATDPN", "ATD", "ATAR", "ATFCSM0", "ATFCSD300000", "ATFCSM1"}
+    if cmd in base:
+        return cmd
+    if re.fullmatch(r"AT(SH|FCSH)18DA[0-9A-F]{2}F1", cmd):
+        return cmd
+    if re.fullmatch(r"ATCRA18DAF1[0-9A-F]{2}", cmd):
+        return cmd
+    if cmd.startswith("22") and cmd[2:] in IDENTIFY_DIDS:
+        return cmd
+    raise ForbiddenCommandError(cmd)
+
+
+def check_vag29_allowed(command: str) -> str:
+    """For VAG's 29-bit addressing scheme (profile opt-in only, see
+    `address_schemes`): adapter/protocol setup, the ATSH/ATFCSH/ATCRA header
+    forms over 17FC00xx (request) / 17FE00xx (response), and
+    ReadDataByIdentifier (0x22) like any other sweep traffic - never a VIN
+    DID. These header forms are accepted nowhere else: check_sweep_allowed
+    and every other validator reject them."""
+    cmd = normalize(command)
+    base = {*ADAPTER_SETUP, "ATSP7", "ATDPN", "ATD", "ATAR", "ATFCSM0", "ATFCSD300000", "ATFCSM1"}
+    if cmd in base:
+        return cmd
+    if re.fullmatch(r"AT(SH|FCSH)17FC00[0-9A-F]{2}", cmd):
+        return cmd
+    if re.fullmatch(r"ATCRA17FE00[0-9A-F]{2}", cmd):
+        return cmd
+    if re.fullmatch(r"22[0-9A-F]{4}", cmd):
+        if cmd[2:] in VIN_DIDS:
+            raise ForbiddenCommandError(cmd)
+        return cmd
+    raise ForbiddenCommandError(cmd)
+
+
 PROFILES_DIR = Path(__file__).parent / "profiles"
 PROFILE_ID_PATTERN = re.compile(r"[a-z0-9-]+")
 # Guards against a pasted VIN ending up in a profile (and thus a public PR) by
@@ -262,6 +303,9 @@ PROFILE_DID_PATTERN = re.compile(r"[0-9A-F]{4}")
 PROFILE_STATUSES = frozenset({"unverified", "plausible", "validated"})
 PROFILE_POLL_MODES = frozenset({"once", "watch", "survey"})
 MIN_PROFILE_INTERVAL = 5.0
+# Opt-in non-standard 29-bit addressing schemes a profile may request beyond
+# plain ISO 15765-4 normal fixed addressing (see check_vag29_allowed).
+KNOWN_ADDRESS_SCHEMES = frozenset({"vag-29bit"})
 
 
 class ProfileError(Exception):
@@ -314,6 +358,7 @@ class Profile:
     vehicles: list[str]
     sources: list[ProfileSource]
     modules: list[Module]
+    address_schemes: list[str] = field(default_factory=list)
 
 
 def _scan_for_vin_like(value: object, path: Path, context: str) -> None:
@@ -561,8 +606,9 @@ def load_profile(path: Path) -> Profile:
         "vehicles",
         "sources",
         "modules",
+        "address_schemes",
     }
-    _check_keys(raw, root_keys, root_keys, path, "<root>")
+    _check_keys(raw, root_keys, root_keys - {"address_schemes"}, path, "<root>")
 
     if raw.get("schema") != 1:
         raise ProfileError(path, "schema", "must be 1")
@@ -591,6 +637,17 @@ def load_profile(path: Path) -> Profile:
     sources = _load_sources(raw.get("sources"), path)
     modules = _load_modules(raw.get("modules"), protocol, path)
 
+    address_schemes_raw = raw.get("address_schemes", [])
+    if not isinstance(address_schemes_raw, list) or not all(
+        isinstance(s, str) for s in address_schemes_raw
+    ):
+        raise ProfileError(path, "address_schemes", "must be a list of strings")
+    unknown_schemes = set(address_schemes_raw) - KNOWN_ADDRESS_SCHEMES
+    if unknown_schemes:
+        raise ProfileError(
+            path, "address_schemes", f"unknown scheme(s): {sorted(unknown_schemes)}"
+        )
+
     return Profile(
         schema=1,
         id=profile_id,
@@ -600,6 +657,7 @@ def load_profile(path: Path) -> Profile:
         vehicles=list(vehicles),
         sources=sources,
         modules=modules,
+        address_schemes=list(address_schemes_raw),
     )
 
 

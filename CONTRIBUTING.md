@@ -57,6 +57,7 @@ any key not listed here:
 | `name`, `description` | yes | free text |
 | `protocol` | yes | `"6"` (ISO 15765-4, 11-bit, 500k) or `"7"` (29-bit, 500k) |
 | `vehicles` | yes | list of free-text vehicle names, at least one; mark what you tested |
+| `address_schemes` | no, default `[]` | opt-in non-standard 29-bit addressing schemes `record` should also probe for; currently only `"vag-29bit"` (VAG's `17FC00xx`/`17FE00xx` scheme) |
 | `[[sources]]` | at least one | `title`, `url`, `license` |
 | `[[modules]]` | yes | `id` (unique), `request` (11-bit up to `7FF`, or `18DAxxF1` with the module's effective protocol `"7"`), optional `response` (`77A`-style or `18DAF1xx`; omit if unknown, then only single-frame replies work), optional `protocol` (`"6"`/`"7"`, overrides the profile's protocol for this module only), optional `discover` (list of `["start", "end"]` DID ranges) |
 | `[[modules.dids]]` | yes | `did` (4 hex, unique per module), `name` (optional when `status` is `unverified` or `poll` is `survey`), `status`, `poll`, `interval` (seconds, >= 5, required for `watch`/`survey`, not allowed for `once`) |

@@ -1896,6 +1896,69 @@ def test_ecus11_discovery_finds_positive_and_negative_responders_and_ignores_sil
     assert ecus["705"]["identify"]["F189"].startswith("NRC")
 
 
+def test_record_detects_and_recovers_lost_adapter_formatting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", [0x710])
+    current_header = {"value": ""}
+    lost = {"value": False}
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("ATSH"):
+            current_header["value"] = cmd[4:]
+            return b"OK\r>"
+        if cmd in ("ATE0", "ATL0", "ATS0", "ATH1"):
+            # The recovery commands `execute_guarded` sends - restores
+            # formatting, like a real ELM327 would.
+            lost["value"] = False
+            return b"OK\r>"
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if current_header["value"] != "710":
+            return b"NO DATA\r>"
+        if cmd == "22F189":
+            if lost["value"]:
+                # Echo re-enabled, no CAN header, no ISO-TP framing nibble -
+                # the same shape the real-world stray-ATD bug produced.
+                return (cmd + "\r62 F1 89 01").encode() + b"\r>"
+            return hex_reply("77A", bytes([0x62, 0xF1, 0x89, 0x01]))
+        if cmd == "22F187":
+            # A vehicle-side quirk right after this read reverts the
+            # adapter's formatting - nothing in record causes it here, but
+            # the recovery path must catch it regardless of the cause.
+            lost["value"] = True
+            return hex_reply("77A", bytes([0x62, 0xF1, 0x87, 0x01]))
+        if cmd == "22F191":
+            return hex_reply("77A", bytes([0x62, 0xF1, 0x91, 0x01]))
+        if cmd == "22F197":
+            return hex_reply("77A", bytes([0x62, 0xF1, 0x97]) + b"X")
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    async def scenario() -> cx.RunState:
+        state = cx.RunState.new("vehicle", "fake")
+        async with cx.connect_adapter("fake", False, tmp_path / "ecus11.jsonl", "vehicle") as link:
+            assert link is not None
+            await cx._inventory_ecus11(link, state, None)
+        return state
+
+    state = asyncio.run(scenario())
+    ecus = state.result("ecus11")
+    assert isinstance(ecus, dict)
+    # F189 recovered via the retry, despite the mid-run format loss.
+    assert ecus["710"]["identify"]["F189"] == "OK"
+
+    log_path = next(tmp_path.glob("*.jsonl"))
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e["status"] == "FORMAT_LOST" for e in entries)
+    assert not any(e["command"] == "ATD" for e in entries)
+
+
 def test_ecus29_discovery_finds_fake_ecu_and_ignores_silence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

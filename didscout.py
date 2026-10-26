@@ -644,9 +644,7 @@ def load_profile(path: Path) -> Profile:
         raise ProfileError(path, "address_schemes", "must be a list of strings")
     unknown_schemes = set(address_schemes_raw) - KNOWN_ADDRESS_SCHEMES
     if unknown_schemes:
-        raise ProfileError(
-            path, "address_schemes", f"unknown scheme(s): {sorted(unknown_schemes)}"
-        )
+        raise ProfileError(path, "address_schemes", f"unknown scheme(s): {sorted(unknown_schemes)}")
 
     return Profile(
         schema=1,
@@ -1130,13 +1128,19 @@ class AdapterLink:
         validator: Callable[[str], str] = check_allowed,
         responder: str | None = None,
         module: str | None = None,
+        log: bool = True,
     ) -> Exchange:
-        """Runs and logs `command`; fails closed by raising ProbeAbortedError if the
-        session became unusable or a critical AT command did not come back OK.
-        `module` is only given for `record`'s watch/discovery reads, so the log
-        alone says which known ECU a given exchange belongs to."""
+        """Runs `command`, logging it unless `log` is False; fails closed by
+        raising ProbeAbortedError if the session became unusable or a
+        critical AT command did not come back OK. `module` is only given for
+        `record`'s watch/discovery reads, so the log alone says which known
+        ECU a given exchange belongs to. `log=False` lets a caller - `record`'s
+        watch scheduler and discovery batches - decide whether an exchange is
+        worth writing only after seeing its result, without skipping the
+        transport-failure check below."""
         ex = await self.session.run(command, validator, responder)
-        self.record(ex, stage, module)
+        if log:
+            self.record(ex, stage, module)
         critical = command.startswith("AT") and command not in self.non_critical_at
         if not self.session.usable or (critical and ex.status != "OK"):
             raise ProbeAbortedError(f"{command}: {ex.status}; disconnect and retry")
@@ -1929,7 +1933,128 @@ async def _inventory_ecus11(link: AdapterLink, state: RunState, profile: Profile
     state.set_result("ecus11", ecus)
 
 
-INVENTORY_STAGE_ORDER = ("adapter", "protocol", "mode01", "obduds", "ecus11")
+# 29-bit normal-fixed-addressing target ids: any two-hex id except the tester
+# address (0xF1) - used for both the plain ISO 15765-4 scheme and, with a
+# different request/response pair, the VAG scheme (see check_vag29_allowed).
+ECU29_IDS = [f"{i:02X}" for i in range(0x100) if i != 0xF1]
+VAG29_IDS = [f"{i:02X}" for i in range(0x100)]
+
+
+async def _discover_ecus(
+    execute: Callable[[str, str, str | None], Awaitable[Exchange]],
+    stage: str,
+    candidates: list[str],
+    skip: set[str],
+    make_request: Callable[[str], str],
+    make_response: Callable[[str], str] | None,
+) -> dict[str, str]:
+    """Probes `make_request(id)` with `22F189` for every id in `candidates`
+    not in `skip`; any reply frame - even a first frame alone - proves an ECU
+    answered (the same rule `_inventory_ecus11` uses). Returns newly found
+    {id: response_header}. `make_response` gives the expected response header
+    directly for a fixed-addressing scheme (29-bit); pass None to use
+    whatever header actually answered instead (11-bit, where the response id
+    isn't implied by the request)."""
+    found: dict[str, str] = {}
+    for candidate in candidates:
+        if candidate in skip:
+            continue
+        request = make_request(candidate)
+        await execute(f"ATSH{request}", stage, None)
+        ex = await execute("22F189", stage, None)
+        parsed = parse_isotp("22F189", ex.response)
+        seen = {header for header, _payload in parsed.messages} | parsed.partial_headers
+        if make_response is not None:
+            if seen:
+                found[candidate] = make_response(candidate)
+        else:
+            for header in seen:
+                if header != request:
+                    found[candidate] = header
+    return found
+
+
+async def _identify_new_ecus(
+    execute: Callable[[str, str, str | None], Awaitable[Exchange]],
+    found: dict[str, str],
+    make_request: Callable[[str], str],
+    stage: str,
+) -> dict[str, object]:
+    """Identifies every newly found {id: response} pair the same way
+    `_inventory_ecus11` does for its own ECUs: full header/filter/flow-
+    control setup, then the four identification DIDs."""
+    results: dict[str, object] = {}
+    for candidate, response in sorted(found.items()):
+        request = make_request(candidate)
+        await execute(f"ATSH{request}", stage, None)
+        await execute(f"ATCRA{response}", stage, None)
+        await execute(f"ATFCSH{request}", stage, None)
+        await execute("ATFCSD300000", stage, None)
+        await execute("ATFCSM1", stage, None)
+        identify_values = await read_identify_dids(execute, response, request)
+        results[candidate] = {"response": response, "identify": identify_values}
+        await execute("ATFCSM0", stage, None)
+    return results
+
+
+async def _inventory_ecus29(link: AdapterLink, state: RunState, profile: Profile | None) -> None:
+    """29-bit normal-fixed-addressing ECU inventory (ISO 15765-4, protocol 7):
+    probes every target except the tester address and any ECU already known
+    from OBDonUDS, then - only if the profile opts in via `address_schemes`
+    (see check_vag29_allowed) - also probes VAG's 17FC00xx/17FE00xx scheme."""
+
+    async def execute(command: str, stage: str, responder: str | None = None) -> Exchange:
+        return await link.execute(command, stage, check_ecus29_allowed, responder)
+
+    await execute("ATSP7", "ecus29-setup")
+    await execute("ATDPN", "ecus29-setup")
+    await execute("ATAR", "ecus29-setup")
+
+    obduds = state.result("obduds") or {}
+    known_obduds_ecus = (
+        {responder[-2:] for responder in obduds} if isinstance(obduds, dict) else set()
+    )
+
+    found = await _discover_ecus(
+        execute,
+        "ecus29-discovery",
+        ECU29_IDS,
+        known_obduds_ecus,
+        lambda ecu: f"18DA{ecu}F1",
+        lambda ecu: f"18DAF1{ecu}",
+    )
+    await execute("ATAR", "ecus29-discovery-done")
+    identified = await _identify_new_ecus(
+        execute, found, lambda ecu: f"18DA{ecu}F1", "ecus29-identify-setup"
+    )
+    await execute("ATAR", "ecus29-cleanup")
+    state.set_result("ecus29", identified)
+
+    if profile is not None and "vag-29bit" in profile.address_schemes:
+
+        async def execute_vag(command: str, stage: str, responder: str | None = None) -> Exchange:
+            return await link.execute(command, stage, check_vag29_allowed, responder)
+
+        await execute_vag("ATSP7", "ecus29-vag-setup")
+        await execute_vag("ATDPN", "ecus29-vag-setup")
+        await execute_vag("ATAR", "ecus29-vag-setup")
+        vag_found = await _discover_ecus(
+            execute_vag,
+            "ecus29-vag-discovery",
+            VAG29_IDS,
+            set(),
+            lambda ecu: f"17FC00{ecu}",
+            lambda ecu: f"17FE00{ecu}",
+        )
+        await execute_vag("ATAR", "ecus29-vag-discovery-done")
+        vag_identified = await _identify_new_ecus(
+            execute_vag, vag_found, lambda ecu: f"17FC00{ecu}", "ecus29-vag-identify-setup"
+        )
+        await execute_vag("ATAR", "ecus29-vag-cleanup")
+        state.set_result("vag29", vag_identified)
+
+
+INVENTORY_STAGE_ORDER = ("adapter", "protocol", "mode01", "obduds", "ecus11", "ecus29")
 INVENTORY_STAGE_FUNCS: dict[
     str, Callable[[AdapterLink, RunState, Profile | None], Awaitable[None]]
 ] = {
@@ -1938,6 +2063,7 @@ INVENTORY_STAGE_FUNCS: dict[
     "mode01": _inventory_mode01,
     "obduds": _inventory_obduds,
     "ecus11": _inventory_ecus11,
+    "ecus29": _inventory_ecus29,
 }
 
 
@@ -1946,8 +2072,11 @@ def print_inventory_summary(state: RunState) -> None:
     mode01 = state.result("mode01") or {}
     obduds = state.result("obduds") or {}
     ecus11 = state.result("ecus11") or {}
+    ecus29 = state.result("ecus29") or {}
+    vag29 = state.result("vag29") or {}
     assert isinstance(protocol, dict) and isinstance(mode01, dict)
     assert isinstance(obduds, dict) and isinstance(ecus11, dict)
+    assert isinstance(ecus29, dict) and isinstance(vag29, dict)
 
     print()
     print("[record] inventory complete")
@@ -1966,6 +2095,13 @@ def print_inventory_summary(state: RunState) -> None:
             print(f"  11-bit ECU {request} -> {info.get('response')}: F197={name}")
     else:
         print("  11-bit ECUs: none found")
+    if ecus29 or vag29:
+        for ecu, info in {**ecus29, **vag29}.items():
+            assert isinstance(info, dict)
+            name = info.get("identify", {}).get("F197", "-")
+            print(f"  29-bit ECU {ecu} -> {info.get('response')}: F197={name}")
+    else:
+        print("  29-bit ECUs: none found")
 
 
 # `record`'s continuous loop, after the inventory: keeps polling everything it
@@ -2092,14 +2228,34 @@ class RecordWatch:
     is_speed: bool = False
 
 
+def _ecu_record_module(
+    key: str, request: str, response: str, protocol: str, validator: Callable[[str], str]
+) -> RecordModule:
+    """One synthetic RecordModule for an ECU found outside a profile (ecus11,
+    ecus29, VAG, OBDonUDS) - same shape as a profile module, full background
+    discovery (no profile discover ranges of its own), continuous polling
+    through `validator`."""
+    synthetic = Module(id=key, request=request, dids=[], response=response)
+    module = RecordModule(
+        key=key,
+        protocol=protocol,
+        setup=module_setup_commands(synthetic),
+        validator=validator,
+        responder=response,
+        discover_ranges=[],
+    )
+    module.order = discovery_did_order([])
+    return module
+
+
 def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, RecordModule]:
     """Every module `record`'s continuous loop knows about after the
     inventory: a synthetic mode-01 module (if mode 01 answered at all), every
-    profile module, every ECU `_inventory_ecus11` found, and every responder
-    `_inventory_obduds` found - each with its own protocol (mode-01 module:
-    whichever protocol answered mode 01; profile modules: `profile.protocol`;
-    ecus11: "6"; OBDonUDS: "7") and its discovery progress restored from
-    `state`."""
+    profile module, every ECU `_inventory_ecus11`/`_inventory_ecus29` found,
+    and every responder `_inventory_obduds` found - each with its own
+    protocol (mode-01 module: whichever protocol answered mode 01; profile
+    modules: `profile.protocol`; ecus11: "6"; ecus29/VAG/OBDonUDS: "7") and
+    its discovery progress restored from `state`."""
     modules: dict[str, RecordModule] = {}
     mode01 = state.result("mode01") or {}
     mode01_protocol = mode01.get("protocol") if isinstance(mode01, dict) else None
@@ -2135,15 +2291,7 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             response = info.get("response")
             assert isinstance(response, str)
             key = f"ecus11:{request}"
-            synthetic = Module(id=key, request=request, dids=[], response=response)
-            modules[key] = RecordModule(
-                key=key,
-                protocol="6",
-                setup=module_setup_commands(synthetic),
-                validator=check_sweep_allowed,
-                responder=response,
-                discover_ranges=[],
-            )
+            modules[key] = _ecu_record_module(key, request, response, "6", check_sweep_allowed)
 
     obduds = state.result("obduds") or {}
     if isinstance(obduds, dict):
@@ -2151,15 +2299,27 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             assert isinstance(info, dict)
             key = f"obduds:{responder}"
             request = f"18DA{responder[-2:]}F1"
-            synthetic = Module(id=key, request=request, dids=[], response=responder)
-            modules[key] = RecordModule(
-                key=key,
-                protocol="7",
-                setup=module_setup_commands(synthetic),
-                validator=check_sweep_allowed,
-                responder=responder,
-                discover_ranges=[],
-            )
+            modules[key] = _ecu_record_module(key, request, responder, "7", check_sweep_allowed)
+
+    ecus29 = state.result("ecus29") or {}
+    if isinstance(ecus29, dict):
+        for ecu, info in ecus29.items():
+            assert isinstance(info, dict)
+            response = info.get("response")
+            assert isinstance(response, str)
+            key = f"ecus29:{ecu}"
+            request = f"18DA{ecu}F1"
+            modules[key] = _ecu_record_module(key, request, response, "7", check_sweep_allowed)
+
+    vag29 = state.result("vag29") or {}
+    if isinstance(vag29, dict):
+        for ecu, info in vag29.items():
+            assert isinstance(info, dict)
+            response = info.get("response")
+            assert isinstance(response, str)
+            key = f"vag29:{ecu}"
+            request = f"17FC00{ecu}"
+            modules[key] = _ecu_record_module(key, request, response, "7", check_vag29_allowed)
 
     for key, module in modules.items():
         if not module.discoverable:
@@ -2248,13 +2408,20 @@ def build_record_watch(
     return watch
 
 
+DISCOVERY_SILENT_STATUSES = frozenset({"NO DATA", "NRC 31 requestOutOfRange"})
+
+
 async def run_discovery_batch(
     link: AdapterLink, module: RecordModule, state: RunState, state_path: Path
 ) -> list[int]:
     """Reads one batch (RECORD_DISCOVERY_BATCH DIDs) of `module`'s discovery
     work - its pending conditional retries first, else the next slice of its
     scan order - persists the updated position/discovered/conditional set, and
-    returns the DIDs newly found OK in this batch."""
+    returns the DIDs newly found OK in this batch. Writes an individual log
+    entry only for a status other than NO DATA/NRC 31 (the overwhelming
+    majority of a scan); every DID in the batch, found or not, is folded into
+    one trailing `BATCH <first>-<last>`/SUMMARY entry mapping status to
+    count, so the log stays readable without losing the full picture."""
     if module.retry_queue:
         batch, module.retry_queue = (
             module.retry_queue[:RECORD_DISCOVERY_BATCH],
@@ -2266,10 +2433,12 @@ async def run_discovery_batch(
 
     stage = f"discover-{module.key}"
     newly_found: list[int] = []
+    status_counts: dict[str, int] = {}
     for did in batch:
         ex = await link.execute(
-            f"22{did:04X}", stage, module.validator, module.responder, module=module.key
+            f"22{did:04X}", stage, module.validator, module.responder, module=module.key, log=False
         )
+        status_counts[ex.status] = status_counts.get(ex.status, 0) + 1
         if ex.status == "OK":
             module.discovered.add(did)
             module.conditional.discard(did)
@@ -2278,6 +2447,18 @@ async def run_discovery_batch(
             module.conditional.add(did)
         else:
             module.conditional.discard(did)
+        if ex.status not in DISCOVERY_SILENT_STATUSES:
+            link.record(ex, stage, module.key)
+
+    if batch:
+        summary = Exchange(
+            f"BATCH {batch[0]:04X}-{batch[-1]:04X}",
+            json.dumps(status_counts),
+            "SUMMARY",
+            datetime.now(UTC).isoformat(),
+            0.0,
+        )
+        link.record(summary, stage, module.key)
 
     state.save_discovery_state(
         module.key,
@@ -2314,6 +2495,7 @@ class RecordLoopState:
     speed_key: tuple[str, str] | None
     by_key: dict[tuple[str, str], RecordWatch]
     next_due: dict[tuple[str, str], float]
+    profile: Profile | None = None
     latest: dict[str, LiveValue] = field(default_factory=dict)
     current_module_key: str | None = None
     # None after a fresh connect/reconnect: the adapter's actual protocol is
@@ -2325,6 +2507,15 @@ class RecordLoopState:
     discovery_start: float = field(default_factory=time.monotonic)
     discovery_done_initial: int = 0
     last_status: float = field(default_factory=time.monotonic)
+    # Adaptive polling (non-speed watch entries only - see
+    # _record_update_backoff) and change-only logging (every watch entry -
+    # see _record_watch_should_log) bookkeeping, keyed the same as by_key.
+    watch_interval: dict[tuple[str, str], float] = field(default_factory=dict)
+    watch_unchanged: dict[tuple[str, str], int] = field(default_factory=dict)
+    watch_payload: dict[tuple[str, str], str] = field(default_factory=dict)
+    watch_last_logged: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    watch_last_log_time: dict[tuple[str, str], float] = field(default_factory=dict)
+    last_rediscover: float = field(default_factory=time.monotonic)
 
     def current_phase(self) -> str:
         if self.speed_key is None:
@@ -2339,12 +2530,15 @@ def build_record_loop_state(profile: Profile | None, state: RunState) -> RecordL
     watch = build_record_watch(profile, state, modules, speed_key)
     by_key = {(w.module_key, w.command): w for w in watch}
     next_due = {key: time.monotonic() for key in by_key}
+    watch_interval = {key: entry.base_interval for key, entry in by_key.items()}
     discovery_done_initial = sum(m.position for m in modules.values() if m.discoverable)
     return RecordLoopState(
         modules=modules,
         speed_key=speed_key,
         by_key=by_key,
         next_due=next_due,
+        profile=profile,
+        watch_interval=watch_interval,
         discovery_done_initial=discovery_done_initial,
     )
 
@@ -2361,19 +2555,195 @@ async def _record_ensure_module(link: AdapterLink, loop_state: RecordLoopState, 
     loop_state.current_module_key = key
 
 
-def _record_apply_phase(link: AdapterLink, loop_state: RecordLoopState) -> None:
+def _record_apply_phase(link: AdapterLink, loop_state: RecordLoopState) -> bool:
+    """Applies a motion-phase change, if any, and reports whether one
+    happened (the caller uses that to decide whether to rediscover - see
+    RECORD_REDISCOVER_INTERVAL)."""
     new_phase = loop_state.current_phase()
     if new_phase == loop_state.phase:
-        return
+        return False
     if new_phase == "stationary":
         for module in loop_state.modules.values():
             if module.discoverable:
                 module.retry_queue = sorted(module.conditional)
+    for key, entry in loop_state.by_key.items():
+        if not entry.is_speed:
+            loop_state.watch_interval[key] = entry.base_interval
+            loop_state.watch_unchanged[key] = 0
     link.record(
         Exchange("PHASE", new_phase, new_phase.upper(), datetime.now(UTC).isoformat(), 0.0), "phase"
     )
     print(f"[record] phase -> {new_phase}")
     loop_state.phase = new_phase
+    return True
+
+
+RECORD_WATCH_UNCHANGED_THRESHOLD = 3
+RECORD_WATCH_BACKOFF_CAP = 1800.0  # seconds
+RECORD_WATCH_KEEPALIVE_SECONDS = 900.0
+# While stationary, re-probe for ECUs that only wake in some vehicle states
+# (e.g. a charger ECU while charging) even without a phase change.
+RECORD_REDISCOVER_INTERVAL = 1800.0  # seconds
+
+
+def _record_update_backoff(
+    loop_state: RecordLoopState, key: tuple[str, str], entry: RecordWatch, ex: Exchange
+) -> None:
+    """Adaptive polling for one non-speed watch entry: after
+    RECORD_WATCH_UNCHANGED_THRESHOLD consecutive unchanged positive reads,
+    double its interval up to RECORD_WATCH_BACKOFF_CAP; any change - a
+    different payload, or a non-OK status - resets it to `entry.base_interval`."""
+    if ex.status == "OK" and loop_state.watch_payload.get(key) == ex.response:
+        count = loop_state.watch_unchanged.get(key, 0) + 1
+        loop_state.watch_unchanged[key] = count
+        if count >= RECORD_WATCH_UNCHANGED_THRESHOLD:
+            loop_state.watch_interval[key] = min(
+                loop_state.watch_interval.get(key, entry.base_interval) * 2.0,
+                RECORD_WATCH_BACKOFF_CAP,
+            )
+    else:
+        loop_state.watch_unchanged[key] = 0
+        loop_state.watch_interval[key] = entry.base_interval
+    if ex.status == "OK":
+        loop_state.watch_payload[key] = ex.response
+
+
+def _record_watch_should_log(
+    loop_state: RecordLoopState, key: tuple[str, str], ex: Exchange, now: float
+) -> bool:
+    """Change-only logging for one watch/survey read: true for the first
+    read of a key, any change in status or response since the last WRITTEN
+    entry for it, or a keep-alive after RECORD_WATCH_KEEPALIVE_SECONDS even
+    without one."""
+    last = loop_state.watch_last_logged.get(key)
+    if last is None or (ex.status, ex.response) != last:
+        return True
+    return now - loop_state.watch_last_log_time.get(key, 0.0) >= RECORD_WATCH_KEEPALIVE_SECONDS
+
+
+async def _record_rediscover(
+    link: AdapterLink, state: RunState, state_path: Path, loop_state: RecordLoopState
+) -> None:
+    """Re-probes for ECUs that only wake in some vehicle states - ecus11 and
+    ecus29 (plus the VAG scheme if the profile opts in), skipping anything
+    already known - and folds any newly found ECU into the running loop as a
+    fresh RecordModule, joining watch/discovery exactly like one found at
+    startup. The adapter's header/protocol state is unknown to the scheduler
+    afterwards, the same as right after a reconnect."""
+    stage = "rediscover"
+    profile = loop_state.profile
+
+    async def execute11(command: str, s: str, responder: str | None = None) -> Exchange:
+        return await link.execute(command, s, check_ecus11_allowed, responder)
+
+    async def execute29(command: str, s: str, responder: str | None = None) -> Exchange:
+        return await link.execute(command, s, check_ecus29_allowed, responder)
+
+    known_ecus11 = state.result("ecus11") or {}
+    assert isinstance(known_ecus11, dict)
+    await execute11("ATSP6", stage)
+    await execute11("ATDPN", stage)
+    await execute11("ATAR", stage)
+    await execute11("ATCF700", stage)
+    await execute11("ATCM700", stage)
+    candidates11 = [f"{i:03X}" for i in ECU11_REQUEST_IDS]
+    new11 = await _discover_ecus(
+        execute11, stage, candidates11, set(known_ecus11), lambda c: c, None
+    )
+    await execute11("ATAR", f"{stage}-done")
+    identified11 = await _identify_new_ecus(execute11, new11, lambda c: c, f"{stage}-identify")
+    if identified11:
+        state.set_result("ecus11", {**known_ecus11, **identified11})
+        for request, info in identified11.items():
+            assert isinstance(info, dict)
+            key = f"ecus11:{request}"
+            response = info["response"]
+            assert isinstance(response, str)
+            loop_state.modules[key] = _ecu_record_module(
+                key, request, response, "6", check_sweep_allowed
+            )
+
+    known_obduds = state.result("obduds") or {}
+    known_obduds_ecus = {r[-2:] for r in known_obduds} if isinstance(known_obduds, dict) else set()
+    known_ecus29 = state.result("ecus29") or {}
+    assert isinstance(known_ecus29, dict)
+    await execute29("ATSP7", stage)
+    await execute29("ATDPN", stage)
+    await execute29("ATAR", stage)
+    new29 = await _discover_ecus(
+        execute29,
+        stage,
+        ECU29_IDS,
+        set(known_ecus29) | known_obduds_ecus,
+        lambda ecu: f"18DA{ecu}F1",
+        lambda ecu: f"18DAF1{ecu}",
+    )
+    await execute29("ATAR", f"{stage}-done")
+    identified29 = await _identify_new_ecus(
+        execute29, new29, lambda ecu: f"18DA{ecu}F1", f"{stage}-identify"
+    )
+    if identified29:
+        state.set_result("ecus29", {**known_ecus29, **identified29})
+        for ecu, info in identified29.items():
+            assert isinstance(info, dict)
+            key = f"ecus29:{ecu}"
+            response = info["response"]
+            assert isinstance(response, str)
+            loop_state.modules[key] = _ecu_record_module(
+                key, f"18DA{ecu}F1", response, "7", check_sweep_allowed
+            )
+
+    if profile is not None and "vag-29bit" in profile.address_schemes:
+
+        async def execute_vag(command: str, s: str, responder: str | None = None) -> Exchange:
+            return await link.execute(command, s, check_vag29_allowed, responder)
+
+        known_vag29 = state.result("vag29") or {}
+        assert isinstance(known_vag29, dict)
+        await execute_vag("ATSP7", stage)
+        await execute_vag("ATDPN", stage)
+        await execute_vag("ATAR", stage)
+        new_vag = await _discover_ecus(
+            execute_vag,
+            stage,
+            VAG29_IDS,
+            set(known_vag29),
+            lambda ecu: f"17FC00{ecu}",
+            lambda ecu: f"17FE00{ecu}",
+        )
+        await execute_vag("ATAR", f"{stage}-done")
+        identified_vag = await _identify_new_ecus(
+            execute_vag, new_vag, lambda ecu: f"17FC00{ecu}", f"{stage}-identify"
+        )
+        if identified_vag:
+            state.set_result("vag29", {**known_vag29, **identified_vag})
+            for ecu, info in identified_vag.items():
+                assert isinstance(info, dict)
+                key = f"vag29:{ecu}"
+                response = info["response"]
+                assert isinstance(response, str)
+                loop_state.modules[key] = _ecu_record_module(
+                    key, f"17FC00{ecu}", response, "7", check_vag29_allowed
+                )
+
+    state.save(state_path)
+    # The scans above left the adapter's actual header/protocol in whatever
+    # state the last probe set it to - unknown to the scheduler, same as a
+    # fresh reconnect, so the next module switch always resends setup.
+    loop_state.current_module_key = None
+    loop_state.current_protocol = None
+    loop_state.last_rediscover = time.monotonic()
+
+
+async def _record_maybe_rediscover(
+    link: AdapterLink, state: RunState, state_path: Path, loop_state: RecordLoopState, changed: bool
+) -> None:
+    due_for_interval = (
+        loop_state.phase == "stationary"
+        and time.monotonic() - loop_state.last_rediscover >= RECORD_REDISCOVER_INTERVAL
+    )
+    if changed or due_for_interval:
+        await _record_rediscover(link, state, state_path, loop_state)
 
 
 async def record_loop_tick(
@@ -2386,7 +2756,8 @@ async def record_loop_tick(
     due = sorted(key for key, due_at in loop_state.next_due.items() if due_at <= now)
     if due:
         entries = [
-            (key, entry.base_interval, entry.is_speed) for key, entry in loop_state.by_key.items()
+            (key, loop_state.watch_interval.get(key, entry.base_interval), entry.is_speed)
+            for key, entry in loop_state.by_key.items()
         ]
         intervals = stretch_watch_intervals(entries)
         for key in due:
@@ -2399,16 +2770,26 @@ async def record_loop_tick(
                 module.validator,
                 module.responder,
                 module=entry.module_key,
+                log=False,
             )
-            loop_state.latest[entry.command] = LiveValue(ex.response, ex.status, time.monotonic())
-            loop_state.next_due[key] = time.monotonic() + intervals[key]
+            poll_now = time.monotonic()
+            if _record_watch_should_log(loop_state, key, ex, poll_now):
+                link.record(ex, entry.stage, entry.module_key)
+                loop_state.watch_last_logged[key] = (ex.status, ex.response)
+                loop_state.watch_last_log_time[key] = poll_now
+            loop_state.latest[entry.command] = LiveValue(ex.response, ex.status, poll_now)
+            loop_state.next_due[key] = poll_now + intervals[key]
             if entry.is_speed:
                 loop_state.speed_value = decode_speed(entry.command, ex, module.responder)
-                loop_state.speed_fetched = time.monotonic()
-        _record_apply_phase(link, loop_state)
+                loop_state.speed_fetched = poll_now
+            else:
+                _record_update_backoff(loop_state, key, entry, ex)
+        changed = _record_apply_phase(link, loop_state)
+        await _record_maybe_rediscover(link, state, state_path, loop_state, changed)
         print(format_live_summary(loop_state.latest))
     else:
-        _record_apply_phase(link, loop_state)
+        changed = _record_apply_phase(link, loop_state)
+        await _record_maybe_rediscover(link, state, state_path, loop_state, changed)
         discovering = None
         if loop_state.phase == "stationary":
             discovering = next(
@@ -2422,6 +2803,8 @@ async def record_loop_tick(
                 loop_state.by_key[key] = RecordWatch(
                     discovering.key, f"22{did:04X}", RECORD_DISCOVERED_WATCH_INTERVAL, "watch"
                 )
+                loop_state.watch_interval[key] = RECORD_DISCOVERED_WATCH_INTERVAL
+                loop_state.watch_unchanged[key] = 0
                 loop_state.next_due[key] = time.monotonic()
         else:
             due_times = loop_state.next_due.values()
@@ -2546,6 +2929,12 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
         status = str(entry.get("status", ""))
         response_raw = str(entry.get("response", ""))
         stage = str(entry.get("stage", ""))
+
+        if status == "SUMMARY" and command.startswith("BATCH "):
+            # A discovery-batch summary (see run_discovery_batch) holds
+            # aggregate status counts, not a DID sample - every individual
+            # DID it covers that answered OK already has its own entry.
+            continue
 
         header_match = DERIVE_MODULE_HEADER_PATTERN.fullmatch(command)
         if header_match:
@@ -3094,6 +3483,22 @@ def validate_share(path: Path) -> None:
             and entry.get("response") not in MARKER_PATTERNS
         ):
             raise ValueError(f"{path}: line {index}: not a recognised phase marker")
+        if entry.get("status") == "SUMMARY":
+            command = entry.get("command")
+            if not isinstance(command, str) or not re.fullmatch(
+                r"BATCH [0-9A-F]{4}-[0-9A-F]{4}", command
+            ):
+                raise ValueError(f"{path}: line {index}: SUMMARY has invalid command {command!r}")
+            try:
+                counts = json.loads(entry.get("response", "")) if "response" in entry else None
+            except json.JSONDecodeError:
+                counts = None
+            if (
+                not isinstance(counts, dict)
+                or not all(isinstance(k, str) for k in counts)
+                or not all(isinstance(v, int) and not isinstance(v, bool) for v in counts.values())
+            ):
+                raise ValueError(f"{path}: line {index}: SUMMARY response must be status counts")
         _scan_share_value(entry, path, index)
 
 

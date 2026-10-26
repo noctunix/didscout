@@ -92,6 +92,13 @@ doesn't stop the recording.
   `load_profile` before being written out, and skipped entirely if nothing
   manufacturer-specific was found.
 
+If you typed what the display showed during `record` (`soc 54`, `batt 23,5`,
+`54%`, ...), `derive` automatically matches those readings against every raw
+field it saw, reporting the best-fitting linear formula (`display ≈ a·raw +
+b`) per typed quantity under "Matches with your notes" in `report.md`. A DID
+whose field matches strongly enough gets pre-named in the draft, e.g. `name =
+"soc candidate"`.
+
 ```
 uv run python didscout.py derive logs/record_20260101_120000_vehicle --vehicle "my car"
 ```

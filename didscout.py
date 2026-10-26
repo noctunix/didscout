@@ -2262,6 +2262,11 @@ class RecordModule:
     validator: Callable[[str], str]
     responder: str | None
     discover_ranges: list[tuple[int, int]] | None
+    # The module's request header, when it has a fixed one - None for mode 01,
+    # whose "module" is really just a functional-header reset. Lets
+    # `_record_ensure_module` build the cheap ATSH/ATCRA/ATFCSH-only switch
+    # between two flow-control modules without resending ATFCSD/ATFCSM1.
+    request: str | None = None
     order: list[int] = field(default_factory=list)
     position: int = 0
     discovered: set[int] = field(default_factory=set)
@@ -2300,6 +2305,7 @@ def _ecu_record_module(
         validator=validator,
         responder=response,
         discover_ranges=[],
+        request=request,
     )
     module.order = discovery_did_order([])
     return module
@@ -2339,6 +2345,7 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
                 discover_ranges=[
                     (int(start, 16), int(end, 16)) for start, end in (pm.discover or [])
                 ],
+                request=pm.request,
             )
 
     ecus11 = state.result("ecus11") or {}
@@ -2528,9 +2535,13 @@ async def run_discovery_batch(
 
 
 def record_status_line(
-    phase: str, watching: int, modules: dict[str, RecordModule], discovery_rate: float
+    phase: str,
+    watching: int,
+    modules: dict[str, RecordModule],
+    discovery_rate: float,
+    setup_commands_sent: int = 0,
 ) -> str:
-    parts = [f"phase={phase}", f"watching={watching}"]
+    parts = [f"phase={phase}", f"watching={watching}", f"setup={setup_commands_sent}"]
     for key, module in sorted(modules.items()):
         if not module.discoverable:
             continue
@@ -2573,6 +2584,9 @@ class RecordLoopState:
     watch_last_logged: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     watch_last_log_time: dict[tuple[str, str], float] = field(default_factory=dict)
     last_rediscover: float = field(default_factory=time.monotonic)
+    # Successful module-switch setup commands (see `_record_ensure_module`) -
+    # no longer logged individually, counted here for `record_status_line`.
+    setup_commands_sent: int = 0
 
     def current_phase(self) -> str:
         if self.speed_key is None:
@@ -2600,15 +2614,54 @@ def build_record_loop_state(profile: Profile | None, state: RunState) -> RecordL
     )
 
 
+async def _record_run_setup_command(
+    link: AdapterLink, cmd: str, validator: Callable[[str], str]
+) -> Exchange:
+    """Runs one `record-setup` AT command without logging it on success -
+    these commands run every module switch, so logging all of them drowns
+    the log in traffic that doesn't change (see `record_status_line`'s
+    `setup` count instead). A failure is still logged and still aborts the
+    session, exactly like a normal critical `AdapterLink.execute` call."""
+    ex = await link.session.run(cmd, validator, None)
+    if ex.status != "OK":
+        link.record(ex, "record-setup")
+    if not link.session.usable or ex.status != "OK":
+        raise ProbeAbortedError(f"{cmd}: {ex.status}; disconnect and retry")
+    return ex
+
+
 async def _record_ensure_module(link: AdapterLink, loop_state: RecordLoopState, key: str) -> None:
     if key == loop_state.current_module_key:
         return
     module = loop_state.modules[key]
-    if module.protocol != loop_state.current_protocol:
-        await link.execute(FORCE_PROTOCOL[module.protocol], "record-setup", module.validator, None)
+    protocol_changed = module.protocol != loop_state.current_protocol
+    if protocol_changed:
+        await _record_run_setup_command(link, FORCE_PROTOCOL[module.protocol], module.validator)
         loop_state.current_protocol = module.protocol
-    for cmd in module.setup:
-        await link.execute(cmd, "record-setup", module.validator, None)
+
+    previous_module = (
+        loop_state.modules.get(loop_state.current_module_key)
+        if loop_state.current_module_key is not None
+        else None
+    )
+    # Reuse the previous module's flow-control state (ATFCSD/ATFCSM1 persist
+    # on the adapter) when switching between two flow-control modules on the
+    # same protocol - only the header/filter/response-id actually change.
+    reuse_flow_control = (
+        not protocol_changed
+        and previous_module is not None
+        and previous_module.responder is not None
+        and module.responder is not None
+        and module.request is not None
+    )
+    commands = (
+        [f"ATSH{module.request}", f"ATCRA{module.responder}", f"ATFCSH{module.request}"]
+        if reuse_flow_control
+        else module.setup
+    )
+    for cmd in commands:
+        await _record_run_setup_command(link, cmd, module.validator)
+        loop_state.setup_commands_sent += 1
     loop_state.current_module_key = key
 
 
@@ -2880,7 +2933,9 @@ async def record_loop_tick(
         done_now = sum(m.position for m in loop_state.modules.values() if m.discoverable)
         rate = (done_now - loop_state.discovery_done_initial) / elapsed if elapsed > 0 else 0.0
         watching = len(loop_state.by_key)
-        line = record_status_line(loop_state.phase, watching, loop_state.modules, rate)
+        line = record_status_line(
+            loop_state.phase, watching, loop_state.modules, rate, loop_state.setup_commands_sent
+        )
         print(f"[record] {line}")
         loop_state.last_status = time.monotonic()
 

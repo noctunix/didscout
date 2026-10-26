@@ -2641,57 +2641,59 @@ async def _record_rediscover(
 
     known_ecus11 = state.result("ecus11") or {}
     assert isinstance(known_ecus11, dict)
-    await execute11("ATSP6", stage)
-    await execute11("ATDPN", stage)
-    await execute11("ATAR", stage)
-    await execute11("ATCF700", stage)
-    await execute11("ATCM700", stage)
-    candidates11 = [f"{i:03X}" for i in ECU11_REQUEST_IDS]
-    new11 = await _discover_ecus(
-        execute11, stage, candidates11, set(known_ecus11), lambda c: c, None
-    )
-    await execute11("ATAR", f"{stage}-done")
-    identified11 = await _identify_new_ecus(execute11, new11, lambda c: c, f"{stage}-identify")
-    if identified11:
-        state.set_result("ecus11", {**known_ecus11, **identified11})
-        for request, info in identified11.items():
-            assert isinstance(info, dict)
-            key = f"ecus11:{request}"
-            response = info["response"]
-            assert isinstance(response, str)
-            loop_state.modules[key] = _ecu_record_module(
-                key, request, response, "6", check_sweep_allowed
-            )
+    candidates11 = [f"{i:03X}" for i in ECU11_REQUEST_IDS if f"{i:03X}" not in known_ecus11]
+    if candidates11:
+        await execute11("ATSP6", stage)
+        await execute11("ATDPN", stage)
+        await execute11("ATAR", stage)
+        await execute11("ATCF700", stage)
+        await execute11("ATCM700", stage)
+        new11 = await _discover_ecus(execute11, stage, candidates11, set(), lambda c: c, None)
+        await execute11("ATAR", f"{stage}-done")
+        identified11 = await _identify_new_ecus(execute11, new11, lambda c: c, f"{stage}-identify")
+        if identified11:
+            state.set_result("ecus11", {**known_ecus11, **identified11})
+            for request, info in identified11.items():
+                assert isinstance(info, dict)
+                key = f"ecus11:{request}"
+                response = info["response"]
+                assert isinstance(response, str)
+                loop_state.modules[key] = _ecu_record_module(
+                    key, request, response, "6", check_sweep_allowed
+                )
 
     known_obduds = state.result("obduds") or {}
     known_obduds_ecus = {r[-2:] for r in known_obduds} if isinstance(known_obduds, dict) else set()
     known_ecus29 = state.result("ecus29") or {}
     assert isinstance(known_ecus29, dict)
-    await execute29("ATSP7", stage)
-    await execute29("ATDPN", stage)
-    await execute29("ATAR", stage)
-    new29 = await _discover_ecus(
-        execute29,
-        stage,
-        ECU29_IDS,
-        set(known_ecus29) | known_obduds_ecus,
-        lambda ecu: f"18DA{ecu}F1",
-        lambda ecu: f"18DAF1{ecu}",
-    )
-    await execute29("ATAR", f"{stage}-done")
-    identified29 = await _identify_new_ecus(
-        execute29, new29, lambda ecu: f"18DA{ecu}F1", f"{stage}-identify"
-    )
-    if identified29:
-        state.set_result("ecus29", {**known_ecus29, **identified29})
-        for ecu, info in identified29.items():
-            assert isinstance(info, dict)
-            key = f"ecus29:{ecu}"
-            response = info["response"]
-            assert isinstance(response, str)
-            loop_state.modules[key] = _ecu_record_module(
-                key, f"18DA{ecu}F1", response, "7", check_sweep_allowed
-            )
+    skip29 = set(known_ecus29) | known_obduds_ecus
+    candidates29 = [ecu for ecu in ECU29_IDS if ecu not in skip29]
+    if candidates29:
+        await execute29("ATSP7", stage)
+        await execute29("ATDPN", stage)
+        await execute29("ATAR", stage)
+        new29 = await _discover_ecus(
+            execute29,
+            stage,
+            candidates29,
+            set(),
+            lambda ecu: f"18DA{ecu}F1",
+            lambda ecu: f"18DAF1{ecu}",
+        )
+        await execute29("ATAR", f"{stage}-done")
+        identified29 = await _identify_new_ecus(
+            execute29, new29, lambda ecu: f"18DA{ecu}F1", f"{stage}-identify"
+        )
+        if identified29:
+            state.set_result("ecus29", {**known_ecus29, **identified29})
+            for ecu, info in identified29.items():
+                assert isinstance(info, dict)
+                key = f"ecus29:{ecu}"
+                response = info["response"]
+                assert isinstance(response, str)
+                loop_state.modules[key] = _ecu_record_module(
+                    key, f"18DA{ecu}F1", response, "7", check_sweep_allowed
+                )
 
     if profile is not None and "vag-29bit" in profile.address_schemes:
 
@@ -2700,31 +2702,33 @@ async def _record_rediscover(
 
         known_vag29 = state.result("vag29") or {}
         assert isinstance(known_vag29, dict)
-        await execute_vag("ATSP7", stage)
-        await execute_vag("ATDPN", stage)
-        await execute_vag("ATAR", stage)
-        new_vag = await _discover_ecus(
-            execute_vag,
-            stage,
-            VAG29_IDS,
-            set(known_vag29),
-            lambda ecu: f"17FC00{ecu}",
-            lambda ecu: f"17FE00{ecu}",
-        )
-        await execute_vag("ATAR", f"{stage}-done")
-        identified_vag = await _identify_new_ecus(
-            execute_vag, new_vag, lambda ecu: f"17FC00{ecu}", f"{stage}-identify"
-        )
-        if identified_vag:
-            state.set_result("vag29", {**known_vag29, **identified_vag})
-            for ecu, info in identified_vag.items():
-                assert isinstance(info, dict)
-                key = f"vag29:{ecu}"
-                response = info["response"]
-                assert isinstance(response, str)
-                loop_state.modules[key] = _ecu_record_module(
-                    key, f"17FC00{ecu}", response, "7", check_vag29_allowed
-                )
+        candidates_vag = [ecu for ecu in VAG29_IDS if ecu not in known_vag29]
+        if candidates_vag:
+            await execute_vag("ATSP7", stage)
+            await execute_vag("ATDPN", stage)
+            await execute_vag("ATAR", stage)
+            new_vag = await _discover_ecus(
+                execute_vag,
+                stage,
+                candidates_vag,
+                set(),
+                lambda ecu: f"17FC00{ecu}",
+                lambda ecu: f"17FE00{ecu}",
+            )
+            await execute_vag("ATAR", f"{stage}-done")
+            identified_vag = await _identify_new_ecus(
+                execute_vag, new_vag, lambda ecu: f"17FC00{ecu}", f"{stage}-identify"
+            )
+            if identified_vag:
+                state.set_result("vag29", {**known_vag29, **identified_vag})
+                for ecu, info in identified_vag.items():
+                    assert isinstance(info, dict)
+                    key = f"vag29:{ecu}"
+                    response = info["response"]
+                    assert isinstance(response, str)
+                    loop_state.modules[key] = _ecu_record_module(
+                        key, f"17FC00{ecu}", response, "7", check_vag29_allowed
+                    )
 
     state.save(state_path)
     # The scans above left the adapter's actual header/protocol in whatever

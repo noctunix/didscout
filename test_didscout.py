@@ -1652,7 +1652,7 @@ def test_record_resumes_unfinished_run_and_new_flag_starts_fresh(
 
     result = asyncio.run(cx.record("fake", None, "vehicle", tmp_path, False))
     assert result == 130
-    assert calls == ["protocol", "mode01", "obduds", "ecus11"]
+    assert calls == ["protocol", "mode01", "obduds", "ecus11", "ecus29"]
     # finished stays False: a `record` run never ends on its own, only on
     # Ctrl-C, so the next start resumes the continuous loop, not the inventory.
     assert cx.RunState.load(existing / "state.json").finished is False
@@ -1696,6 +1696,10 @@ def test_record_reconnects_after_transport_error_and_resumes_interrupted_stage(
         calls.append("ecus11")
         state.set_result("ecus11", {})
 
+    async def fake_ecus29(_link: object, state: cx.RunState, _profile: object) -> None:
+        calls.append("ecus29")
+        state.set_result("ecus29", {})
+
     monkeypatch.setattr(
         cx,
         "INVENTORY_STAGE_FUNCS",
@@ -1705,6 +1709,7 @@ def test_record_reconnects_after_transport_error_and_resumes_interrupted_stage(
             "mode01": fake_mode01,
             "obduds": fake_obduds,
             "ecus11": fake_ecus11,
+            "ecus29": fake_ecus29,
         },
     )
 
@@ -1720,7 +1725,7 @@ def test_record_reconnects_after_transport_error_and_resumes_interrupted_stage(
 
     assert result == 130
     # adapter must not be redone on the reconnect - only the interrupted stage is retried.
-    assert calls == ["adapter", "protocol", "protocol", "mode01", "obduds", "ecus11"]
+    assert calls == ["adapter", "protocol", "protocol", "mode01", "obduds", "ecus11", "ecus29"]
 
     run_dir = next(tmp_path.glob("record_*"))
     entries = [json.loads(line) for line in (run_dir / "capture.jsonl").read_text().splitlines()]
@@ -1755,6 +1760,9 @@ def test_record_marks_stage_failed_after_three_consecutive_failures(
     async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
         state.set_result("ecus11", {})
 
+    async def fake_ecus29(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus29", {})
+
     monkeypatch.setattr(
         cx,
         "INVENTORY_STAGE_FUNCS",
@@ -1764,6 +1772,7 @@ def test_record_marks_stage_failed_after_three_consecutive_failures(
             "mode01": fake_mode01,
             "obduds": fake_obduds,
             "ecus11": fake_ecus11,
+            "ecus29": fake_ecus29,
         },
     )
 
@@ -2493,6 +2502,9 @@ def test_record_ctrl_c_runs_derive_and_share_on_its_own_run_dir(
     async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
         state.set_result("ecus11", {})
 
+    async def fake_ecus29(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus29", {})
+
     monkeypatch.setattr(
         cx,
         "INVENTORY_STAGE_FUNCS",
@@ -2502,6 +2514,7 @@ def test_record_ctrl_c_runs_derive_and_share_on_its_own_run_dir(
             "mode01": fake_mode01,
             "obduds": fake_obduds,
             "ecus11": fake_ecus11,
+            "ecus29": fake_ecus29,
         },
     )
 
@@ -2606,6 +2619,9 @@ def test_record_starts_note_reader_once_across_reconnects_and_stops_on_exit(
     async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
         state.set_result("ecus11", {})
 
+    async def fake_ecus29(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus29", {})
+
     monkeypatch.setattr(
         cx,
         "INVENTORY_STAGE_FUNCS",
@@ -2615,6 +2631,7 @@ def test_record_starts_note_reader_once_across_reconnects_and_stops_on_exit(
             "mode01": fake_mode01,
             "obduds": fake_obduds,
             "ecus11": fake_ecus11,
+            "ecus29": fake_ecus29,
         },
     )
 
@@ -2763,6 +2780,9 @@ def test_record_no_inhibit_flag_spawns_nothing(
     async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
         state.set_result("ecus11", {})
 
+    async def fake_ecus29(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus29", {})
+
     monkeypatch.setattr(
         cx,
         "INVENTORY_STAGE_FUNCS",
@@ -2772,6 +2792,7 @@ def test_record_no_inhibit_flag_spawns_nothing(
             "mode01": fake_mode01,
             "obduds": fake_obduds,
             "ecus11": fake_ecus11,
+            "ecus29": fake_ecus29,
         },
     )
 
@@ -2843,6 +2864,9 @@ def test_record_terminates_inhibit_process_on_ctrl_c(
     async def fake_ecus11(_link: object, state: cx.RunState, _profile: object) -> None:
         state.set_result("ecus11", {})
 
+    async def fake_ecus29(_link: object, state: cx.RunState, _profile: object) -> None:
+        state.set_result("ecus29", {})
+
     monkeypatch.setattr(
         cx,
         "INVENTORY_STAGE_FUNCS",
@@ -2852,6 +2876,7 @@ def test_record_terminates_inhibit_process_on_ctrl_c(
             "mode01": fake_mode01,
             "obduds": fake_obduds,
             "ecus11": fake_ecus11,
+            "ecus29": fake_ecus29,
         },
     )
 
@@ -2918,6 +2943,7 @@ def test_record_terminates_inhibit_process_on_unhandled_cancellation(
             "mode01": fake_adapter,
             "obduds": fake_adapter,
             "ecus11": fake_adapter,
+            "ecus29": fake_adapter,
         },
     )
     monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))

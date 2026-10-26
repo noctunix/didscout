@@ -2808,6 +2808,149 @@ def test_classify_note_marker_recognises_english_and_german() -> None:
     assert cx.classify_note_marker("idle but also driving") is None  # ambiguous
 
 
+def test_parse_note_extracts_pairs() -> None:
+    assert cx.parse_note("soc 54 kw 180") == [("soc", 54.0), ("kw", 180.0)]
+    assert cx.parse_note("batt 23,5") == [("batt", 23.5)]
+    assert cx.parse_note("km 17064") == [("km", 17064.0)]
+    assert cx.parse_note("soc: 54") == [("soc", 54.0)]
+    assert cx.parse_note("soc=54") == [("soc", 54.0)]
+    assert cx.parse_note("soc54") == [("soc", 54.0)]
+    assert cx.parse_note("soc 54%") == [("soc", 54.0)]  # unit after a word's number is dropped
+    assert cx.parse_note("54%") == [("percent", 54.0)]  # bare number+unit: unit becomes the key
+    assert cx.parse_note("now charging at home") == []  # marker word, no key
+    assert cx.parse_note("charging 54") == []  # marker word is never a key, even with a number
+    assert cx.parse_note("just driving around, nothing to note") == []
+    assert cx.parse_note("") == []
+
+
+def _did_entry(
+    base: datetime, t: float, stage: str, did: str, value: int, width: int = 2
+) -> dict[str, object]:
+    return _capture_entry(
+        base,
+        t,
+        stage,
+        f"22{did}",
+        "OK",
+        _hex_reply("77A", bytes([0x62]) + bytes.fromhex(did) + value.to_bytes(width, "big")),
+        "profile:gateway",
+    )
+
+
+def _note_entry(base: datetime, t: float, text: str) -> dict[str, object]:
+    return _capture_entry(base, t, "display", "NOTE", "NOTE", text)
+
+
+def test_derive_matches_notes_to_raw_field_and_names_draft_did(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    soc_values = [20, 30, 40, 50]
+    times = [10.0, 20.0, 30.0, 40.0]
+    noise_values = [5, 97, 3, 250]
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH710", "OK", "OK"),
+        _capture_entry(base, 0.5, "record-setup", "ATCRA77A", "OK", "OK"),
+    ]
+    for i, (soc, t) in enumerate(zip(soc_values, times, strict=True)):
+        stage = "discover-profile:gateway" if i == 0 else "watch"
+        entries.append(_did_entry(base, t, stage, "2A50", 10 * soc + 5))
+        entries.append(_did_entry(base, t + 0.05, stage, "2A60", noise_values[i]))
+        entries.append(_note_entry(base, t + 1, f"soc {soc}"))
+    _write_capture(run_dir, entries)
+
+    profile_path, report_path = cx.derive(run_dir, vehicle="Test Car")
+    assert profile_path is not None
+
+    profile = cx.load_profile(profile_path)
+    module = next(m for m in profile.modules if m.id == "ecu-710")
+    by_did = {d.did: d for d in module.dids}
+    assert by_did["2A50"].name == "soc candidate"
+    assert by_did["2A60"].name is None
+
+    report = report_path.read_text()
+    section = report.split("## Matches with your notes")[1].split("## Candidates")[0]
+    assert "soc (4 notes)" in section
+    assert "7E0" not in section  # sanity: this run never used that header
+    first_match_line = next(line for line in section.splitlines() if line.startswith("-"))
+    assert "710/77A" in first_match_line
+    assert "DID 2A50" in first_match_line
+    assert "offset 0, width 2, unsigned" in first_match_line
+    assert "r=+1.000" in first_match_line
+    assert "0.1000·raw" in first_match_line
+    assert "-0.5000" in first_match_line
+    assert "n=4" in first_match_line
+    assert "soc candidate" in first_match_line
+
+
+def test_derive_notes_need_three_with_two_distinct_values(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH710", "OK", "OK"),
+        _capture_entry(base, 0.5, "record-setup", "ATCRA77A", "OK", "OK"),
+        _did_entry(base, 1, "discover-profile:gateway", "2A50", 105),
+        _did_entry(base, 2, "watch", "2A50", 205),
+        _did_entry(base, 3, "watch", "2A50", 305),
+    ]
+    too_few = [*entries, _note_entry(base, 1.1, "soc 10"), _note_entry(base, 2.1, "soc 20")]
+    data = cx.analyze_capture(too_few)
+    assert "soc" not in cx.match_notes(data)
+
+    one_value = [
+        *entries,
+        _note_entry(base, 1.1, "soc 10"),
+        _note_entry(base, 2.1, "soc 10"),
+        _note_entry(base, 3.1, "soc 10"),
+    ]
+    data = cx.analyze_capture(one_value)
+    assert "soc" not in cx.match_notes(data)
+
+
+def test_match_notes_ignores_stale_samples(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH710", "OK", "OK"),
+        _capture_entry(base, 0.5, "record-setup", "ATCRA77A", "OK", "OK"),
+        _did_entry(base, 0, "discover-profile:gateway", "2A50", 10 * 20 + 5),
+        _note_entry(base, 1, "soc 20"),
+        _did_entry(base, 10, "watch", "2A50", 10 * 25 + 5),
+        _note_entry(base, 11, "soc 25"),
+        _did_entry(base, 20, "watch", "2A50", 10 * 30 + 5),
+        _note_entry(base, 21, "soc 30"),
+        # over 15 minutes after the last sample of 2A50 - must not be used
+        _note_entry(base, 2000, "soc 35"),
+    ]
+    data = cx.analyze_capture(entries)
+    matches = cx.match_notes(data)
+    assert len(data.notes) == 4  # the key-level threshold still sees all 4
+    top = matches["soc"][0]
+    assert top.did == "2A50"
+    assert top.n == 3  # the stale note at t=2000 was dropped
+
+
+def test_match_notes_holding_semantics_with_change_only_entries(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH710", "OK", "OK"),
+        _capture_entry(base, 0.5, "record-setup", "ATCRA77A", "OK", "OK"),
+        # change-only watch entries: the value holds until the next one.
+        _did_entry(base, 0, "discover-profile:gateway", "2A50", 10 * 10 + 5),
+        _did_entry(base, 200, "watch", "2A50", 10 * 20 + 5),
+        _did_entry(base, 400, "watch", "2A50", 10 * 30 + 5),
+        # each note falls well after its sample but before the next one -
+        # it must be matched against the held value, not go unmatched.
+        _note_entry(base, 50, "soc 10"),
+        _note_entry(base, 250, "soc 20"),
+        _note_entry(base, 450, "soc 30"),
+    ]
+    data = cx.analyze_capture(entries)
+    top = cx.match_notes(data)["soc"][0]
+    assert top.n == 3
+    assert top.offset == 0 and top.width == 2 and not top.signed
+    assert top.r == pytest.approx(1.0)
+    assert top.a == pytest.approx(0.1)
+    assert top.b == pytest.approx(-0.5)
+
+
 def test_share_redacts_identity_connection_and_non_marker_notes(tmp_path: Path) -> None:
     base = datetime(2026, 10, 25, tzinfo=UTC)
     run_dir = tmp_path / "record_test"

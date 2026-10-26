@@ -2867,6 +2867,59 @@ DERIVE_RESPONSE_HEADER_PATTERN = re.compile(r"ATCRA(18DAF1[0-9A-F]{2}|[0-9A-F]{3
 DERIVE_DID_COMMAND_PATTERN = re.compile(r"22([0-9A-F]{4})")
 CONDITIONAL_STATUSES = frozenset({"NRC 22 conditionsNotCorrect", "NRC 33 securityAccessDenied"})
 
+# Typed-note ground truth: a word/number pair ("soc 54", "soc: 54", "soc=54",
+# "soc54") or a bare number with a unit stuck directly to it ("54%"). A unit
+# right after a number with a preceding word is just dropped, not a key.
+NOTE_PAIR_PATTERN = re.compile(
+    r"(?:(?P<word>[a-zA-Z]+)\s*[:=]?\s*)?"
+    r"(?P<num>\d+(?:[.,]\d+)?)"
+    r"(?P<unit>%|kw|km|\N{DEGREE SIGN}c|c|v|a)?"
+    r"(?![a-zA-Z])",
+    re.IGNORECASE,
+)
+NOTE_UNIT_KEYS: dict[str, str] = {
+    "%": "percent",
+    "kw": "kw",
+    "km": "km",
+    "\N{DEGREE SIGN}c": "c",
+    "c": "c",
+    "v": "v",
+    "a": "a",
+}
+NOTE_MIN_NOTES = 3
+NOTE_MIN_DISTINCT_VALUES = 2
+NOTE_STALE_SECONDS = 15 * 60.0
+NOTE_NAME_MIN_R = 0.99
+NOTE_NAME_MIN_NOTES = 4
+NOTE_CANDIDATE_FIELDS: tuple[tuple[int, bool], ...] = (
+    (1, False),
+    (2, False),
+    (2, True),
+    (4, False),
+)
+
+
+def parse_note(text: str) -> list[tuple[str, float]]:
+    """Extracts (key, value) ground-truth pairs typed during `record` -
+    "soc 54", "soc: 54,5", "soc=54", "soc54", or a bare "54%" (the unit
+    becomes the key, see NOTE_UNIT_KEYS). A word that is itself a phase
+    marker (see MARKER_PATTERNS) is never a key; anything else that doesn't
+    match is silently ignored."""
+    pairs: list[tuple[str, float]] = []
+    for match in NOTE_PAIR_PATTERN.finditer(text):
+        word = match.group("word")
+        if word is not None and any(p.search(word) for p in MARKER_PATTERNS.values()):
+            continue
+        if word is not None:
+            key = word.lower()
+        else:
+            unit = match.group("unit")
+            if unit is None:
+                continue
+            key = NOTE_UNIT_KEYS[unit.lower()]
+        pairs.append((key, float(match.group("num").replace(",", "."))))
+    return pairs
+
 
 def classify_note_marker(text: str) -> str | None:
     """Canonicalizes a typed note to one of MARKER_PATTERNS's keys, or None if
@@ -2899,9 +2952,17 @@ class ModuleRecord:
 
 
 @dataclass
+class NoteSample:
+    t: float
+    key: str
+    value: float
+
+
+@dataclass
 class DerivedData:
     modules: dict[tuple[str | None, str | None], ModuleRecord]
     speed_series: list[tuple[float, int]]
+    notes: list[NoteSample] = field(default_factory=list)
 
 
 def _entry_seconds(entry: dict[str, object], origin: datetime | None) -> float:
@@ -2922,6 +2983,7 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
     so both are naturally excluded from anything `from_discovery` cares about."""
     modules: dict[tuple[str | None, str | None], ModuleRecord] = {}
     speed_series: list[tuple[float, int]] = []
+    notes: list[NoteSample] = []
     origin: datetime | None = None
     current_request: str | None = None
     current_response: str | None = None
@@ -2959,6 +3021,8 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
             marker = classify_note_marker(response_raw)
             if marker is not None:
                 current_phase = marker
+            for note_key, note_value in parse_note(response_raw):
+                notes.append(NoteSample(t, note_key, note_value))
             continue
 
         if command in SPEED_COMMANDS and status == "OK":
@@ -2988,7 +3052,7 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
         if payload:
             record.samples.append(DidSample(t, payload, current_phase))
 
-    return DerivedData(modules, speed_series)
+    return DerivedData(modules, speed_series, notes)
 
 
 def _most_common_length(payloads: list[bytes]) -> int:
@@ -3119,6 +3183,115 @@ def stationary_monotonic_candidates(record: DidRecord) -> list[tuple[int, int, s
     return found
 
 
+@dataclass
+class NoteMatch:
+    label: str
+    did: str
+    offset: int
+    width: int
+    signed: bool
+    r: float
+    a: float
+    b: float
+    rmse: float
+    n: int
+
+
+def _holding_sample(samples: list[DidSample], t: float, max_age: float) -> DidSample | None:
+    """The last sample at or before `t` (samples are in capture order, so
+    ascending in time) - a change-only watch entry holds until the next one
+    for the same module+command, so this is the value that was showing at
+    `t`. None if the newest eligible sample is older than `max_age`."""
+    best: DidSample | None = None
+    for sample in samples:
+        if sample.t > t:
+            break
+        best = sample
+    if best is None or t - best.t > max_age:
+        return None
+    return best
+
+
+def _lstsq_fit(xs: list[float], ys: list[float]) -> tuple[float, float, float] | None:
+    """Least-squares `y = a*x + b` and its RMSE, or None if `xs` is constant."""
+    n = len(xs)
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    if var_x == 0:
+        return None
+    a = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True)) / var_x
+    b = mean_y - a * mean_x
+    rmse = math.sqrt(sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys, strict=True)) / n)
+    return a, b, rmse
+
+
+def match_notes(data: DerivedData) -> dict[str, list[NoteMatch]]:
+    """For every typed-note key seen at least NOTE_MIN_NOTES times with at
+    least NOTE_MIN_DISTINCT_VALUES distinct values, the top 5 raw fields
+    (across every module/DID with positive samples) whose value held at each
+    note's time best predicts that note's number, ranked by |r| then RMSE."""
+    by_key: dict[str, list[NoteSample]] = {}
+    for note in data.notes:
+        by_key.setdefault(note.key, []).append(note)
+
+    results: dict[str, list[NoteMatch]] = {}
+    for key, notes in by_key.items():
+        if len(notes) < NOTE_MIN_NOTES or len({n.value for n in notes}) < NOTE_MIN_DISTINCT_VALUES:
+            continue
+        candidates: list[NoteMatch] = []
+        for (request, response), module in data.modules.items():
+            if request is None:
+                continue
+            label = _module_label(request, response)
+            for did, record in module.dids.items():
+                if not record.samples:
+                    continue
+                length = _most_common_length([s.payload for s in record.samples])
+                samples = [s for s in record.samples if len(s.payload) == length]
+                for width, signed in NOTE_CANDIDATE_FIELDS:
+                    for offset in range(0, length - width + 1):
+                        xs: list[float] = []
+                        ys: list[float] = []
+                        for note in notes:
+                            held = _holding_sample(samples, note.t, NOTE_STALE_SECONDS)
+                            if held is None:
+                                continue
+                            raw = int.from_bytes(
+                                held.payload[offset : offset + width], "big", signed=signed
+                            )
+                            xs.append(float(raw))
+                            ys.append(note.value)
+                        if len(xs) < 3 or len(set(xs)) <= 1:
+                            continue
+                        r = _pearson(xs, ys)
+                        fit = _lstsq_fit(xs, ys)
+                        if r is None or fit is None:
+                            continue
+                        a, b, rmse = fit
+                        candidates.append(
+                            NoteMatch(label, did, offset, width, signed, r, a, b, rmse, len(xs))
+                        )
+        candidates.sort(key=lambda c: (-abs(c.r), c.rmse))
+        results[key] = candidates[:5]
+    return results
+
+
+def named_candidates(matches: dict[str, list[NoteMatch]]) -> dict[tuple[str, str], str]:
+    """(module label, DID) -> key for every DID whose best matched field
+    reaches NOTE_NAME_MIN_R over at least NOTE_NAME_MIN_NOTES notes - these
+    get `name = "<key> candidate"` in the profile draft."""
+    best: dict[tuple[str, str], tuple[str, float]] = {}
+    for key, top in matches.items():
+        for m in top:
+            if abs(m.r) < NOTE_NAME_MIN_R or m.n < NOTE_NAME_MIN_NOTES:
+                continue
+            did_key = (m.label, m.did)
+            current = best.get(did_key)
+            if current is None or abs(m.r) > current[1]:
+                best[did_key] = (key, abs(m.r))
+    return {did_key: name_r[0] for did_key, name_r in best.items()}
+
+
 def _module_label(request: str | None, response: str | None) -> str:
     req = request or "unknown"
     return f"{req}/{response}" if response else req
@@ -3141,17 +3314,21 @@ class DraftModule:
     request: str
     response: str | None
     protocol: str
-    dids: list[tuple[str, str, float | None]]
+    dids: list[tuple[str, str, float | None, str | None]]
 
 
 def build_draft_modules(
     modules: dict[tuple[str | None, str | None], ModuleRecord],
+    named: dict[tuple[str, str], str] | None = None,
 ) -> list[DraftModule]:
     """Manufacturer modules eligible for the draft profile: any header pair
     with at least one DID that was actually found by discovery (a `discover-`
     stage entry) and read positively at least once. Mode-01 PIDs and announced
     OBDonUDS F4xx/F5xx DIDs never carry a `discover-` stage, so they never
-    qualify - only genuinely new, manufacturer-specific finds do."""
+    qualify - only genuinely new, manufacturer-specific finds do. `named`
+    (from `named_candidates`) supplies a "<key> candidate" name for any DID
+    whose best field matched a typed note strongly enough."""
+    named = named or {}
     drafts: list[DraftModule] = []
     for (request, response), module in modules.items():
         if request is None:
@@ -3162,10 +3339,13 @@ def build_draft_modules(
         if not eligible:
             continue
         protocol = "7" if len(request) == 8 else "6"
-        dids: list[tuple[str, str, float | None]] = []
+        label = _module_label(request, response)
+        dids: list[tuple[str, str, float | None, str | None]] = []
         for did in eligible:
             poll, interval = _classify_did(module.dids[did])
-            dids.append((did, poll, interval))
+            key = named.get((label, did))
+            name = f"{key} candidate" if key is not None else None
+            dids.append((did, poll, interval, name))
         drafts.append(DraftModule(f"ecu-{request.lower()}", request, response, protocol, dids))
     return sorted(drafts, key=lambda m: m.id)
 
@@ -3210,11 +3390,15 @@ def render_profile_draft_toml(*, profile_id: str, vehicle: str, drafts: list[Dra
             lines.append(f"response = {_toml_str(module.response)}")
         if module.protocol != protocol:
             lines.append(f"protocol = {_toml_str(module.protocol)}")
-        for did, poll, interval in module.dids:
+        for did, poll, interval, name in module.dids:
             lines += [
                 "",
                 "[[modules.dids]]",
                 f"did = {_toml_str(did)}",
+            ]
+            if name is not None:
+                lines.append(f"name = {_toml_str(name)}")
+            lines += [
                 'status = "unverified"',
                 f"poll = {_toml_str(poll)}",
             ]
@@ -3223,7 +3407,37 @@ def render_profile_draft_toml(*, profile_id: str, vehicle: str, drafts: list[Dra
     return "\n".join(lines) + "\n"
 
 
-def render_derive_report(data: DerivedData, vehicle: str, source: Path) -> str:
+def _render_note_matches(matches: dict[str, list[NoteMatch]], notes: list[NoteSample]) -> list[str]:
+    counts: dict[str, int] = {}
+    for note in notes:
+        counts[note.key] = counts.get(note.key, 0) + 1
+    lines = ["## Matches with your notes", ""]
+    if not matches:
+        lines += ["- no key had enough notes to match", ""]
+        return lines
+    for key in sorted(matches):
+        lines.append(f"### {key} ({counts.get(key, 0)} notes)")
+        lines.append("")
+        top = matches[key]
+        if not top:
+            lines += ["- no candidate field found", ""]
+            continue
+        for m in top:
+            signedness = "signed" if m.signed else "unsigned"
+            named = abs(m.r) >= NOTE_NAME_MIN_R and m.n >= NOTE_NAME_MIN_NOTES
+            suffix = f' - named "{key} candidate" in the draft' if named else ""
+            lines.append(
+                f"- {m.label} / DID {m.did} / field (offset {m.offset}, width {m.width}, "
+                f"{signedness}): r={m.r:+.3f}, display ≈ {m.a:.4f}·raw + {m.b:+.4f}, "
+                f"RMSE={m.rmse:.3f}, n={m.n}{suffix}"
+            )
+        lines.append("")
+    return lines
+
+
+def render_derive_report(
+    data: DerivedData, vehicle: str, source: Path, matches: dict[str, list[NoteMatch]]
+) -> str:
     modules = sorted(data.modules.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or ""))
     speed_candidates: list[tuple[str, str, int, int, float]] = []
     stationary_candidates: list[tuple[str, str, int, int, str, float]] = []
@@ -3244,6 +3458,7 @@ def render_derive_report(data: DerivedData, vehicle: str, source: Path) -> str:
         f"Vehicle: {vehicle}",
         f"Generated: {datetime.now(UTC).isoformat()}",
         "",
+        *_render_note_matches(matches, data.notes),
         "## Candidates",
         "",
         "### Speed-correlated fields",
@@ -3338,7 +3553,8 @@ def derive(
     capture_path = resolve_capture_path(run_dir_or_file)
     entries = read_capture_entries(capture_path)
     data = analyze_capture(entries)
-    drafts = build_draft_modules(data.modules)
+    note_matches = match_notes(data)
+    drafts = build_draft_modules(data.modules, named_candidates(note_matches))
     vehicle_name = vehicle or "unknown vehicle"
     profile_id = id_ or "profile-draft"
     out_dir = out or capture_path.parent
@@ -3346,7 +3562,7 @@ def derive(
 
     report_path = out_dir / "report.md"
     report_path.write_text(
-        render_derive_report(data, vehicle_name, run_dir_or_file), encoding="utf-8"
+        render_derive_report(data, vehicle_name, run_dir_or_file, note_matches), encoding="utf-8"
     )
 
     profile_path: Path | None = None

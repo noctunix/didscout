@@ -92,12 +92,18 @@ doesn't stop the recording.
   `load_profile` before being written out, and skipped entirely if nothing
   manufacturer-specific was found.
 
-If you typed what the display showed during `record` (`soc 54`, `batt 23,5`,
-`54%`, ...), `derive` automatically matches those readings against every raw
-field it saw, reporting the best-fitting linear formula (`display ≈ a·raw +
-b`) per typed quantity under "Matches with your notes" in `report.md`. A DID
-whose field matches strongly enough gets pre-named in the draft, e.g. `name =
-"soc candidate"`.
+If you typed what the display showed during `record` - word-first or
+number-first, unit glued or spaced, typos and abbreviations included
+(`soc 54`, `49 soc`, `63 sooc`, `105 kw ladung`, `176 km rest`, `17153 km`,
+`54%`, ...) - `derive` automatically matches those readings against every
+raw field it saw, reporting the best-fitting linear formula (`display ≈ a·raw
++ b`) per typed quantity under "Matches with your notes" in `report.md`. A
+DID whose field matches strongly enough gets pre-named in the draft, e.g.
+`name = "soc candidate"`. Charge power is also matched against each field's
+time derivative (shown as `d/dt` in the report), since it never shows up as
+a field's own value, only as how fast an energy field moves - a derivative
+match never names a DID, since the field itself is still just an energy
+counter.
 
 ```
 uv run python didscout.py derive logs/record_20260101_120000_vehicle --vehicle "my car"

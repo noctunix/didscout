@@ -59,145 +59,145 @@ interval = 60
 did = "2A04"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A15"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A26"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A27"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A28"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A29"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A2D"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A2F"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A31"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A3C"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A50"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A52"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A53"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A65"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2A67"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AB3"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AB4"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AB5"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AB7"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AB9"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AC1"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AF5"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AF6"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "2AF8"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules]]
 id = "tyres"
@@ -237,28 +237,28 @@ interval = 30
 did = "18A4"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "18A6"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "18A7"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "18A8"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15
 
 [[modules.dids]]
 did = "18A9"
 status = "unverified"
 poll = "survey"
-interval = 60
+interval = 15

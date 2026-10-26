@@ -2809,9 +2809,9 @@ def test_classify_note_marker_recognises_english_and_german() -> None:
 
 
 def test_parse_note_extracts_pairs() -> None:
-    assert cx.parse_note("soc 54 kw 180") == [("soc", 54.0), ("kw", 180.0)]
-    assert cx.parse_note("batt 23,5") == [("batt", 23.5)]
-    assert cx.parse_note("km 17064") == [("km", 17064.0)]
+    assert cx.parse_note("soc 54 kw 180") == [("soc", 54.0), ("charge_power", 180.0)]
+    assert cx.parse_note("batt 23,5") == [("battery_temp", 23.5)]
+    assert cx.parse_note("km 17064") == [("odometer", 17064.0)]  # 5-6 digit number next to "km"
     assert cx.parse_note("soc: 54") == [("soc", 54.0)]
     assert cx.parse_note("soc=54") == [("soc", 54.0)]
     assert cx.parse_note("soc54") == [("soc", 54.0)]
@@ -2821,6 +2821,20 @@ def test_parse_note_extracts_pairs() -> None:
     assert cx.parse_note("charging 54") == []  # marker word is never a key, even with a number
     assert cx.parse_note("just driving around, nothing to note") == []
     assert cx.parse_note("") == []
+
+
+def test_parse_note_accepts_number_first_forms_and_typos() -> None:
+    # Users type notes number-first, with typos, units glued or spaced.
+    assert cx.parse_note("49 soc") == [("soc", 49.0)]
+    assert cx.parse_note("176 km rest") == [("range", 176.0)]
+    assert cx.parse_note("14 batt temp") == [("battery_temp", 14.0)]
+    assert cx.parse_note("105 kw ladung") == [("charge_power", 105.0)]
+    assert cx.parse_note("63 sooc") == [("soc", 63.0)]
+    assert cx.parse_note("165 reichweote") == [("range", 165.0)]
+    assert cx.parse_note("17153 km") == [("odometer", 17153.0)]
+    assert cx.parse_note("11,5 aussen") == [("outside_temp", 11.5)]
+    assert cx.parse_note("89kw max ladeleistung") == [("max_charge_power", 89.0)]
+    assert cx.parse_note("100 kmh") == [("speed", 100.0)]
 
 
 def _did_entry(
@@ -2880,6 +2894,47 @@ def test_derive_matches_notes_to_raw_field_and_names_draft_did(tmp_path: Path) -
     assert "raw - 0.5000" in first_match_line
     assert "n=4" in first_match_line
     assert "soc candidate" in first_match_line
+
+
+def test_match_notes_matches_charge_power_against_field_derivative() -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    entries = [
+        _capture_entry(base, 0, "record-setup", "ATSH710", "OK", "OK"),
+        _capture_entry(base, 0.5, "record-setup", "ATCRA77A", "OK", "OK"),
+    ]
+    # Charging power never shows as a field's own value - only as how fast
+    # an energy counter moves. Four well-separated windows, each with a
+    # steady local rate (raw units per 50s step); the counter's absolute
+    # value jumps around between windows with no relation to the note.
+    windows = [(100, 1000, 1, 200, 72), (600, 5000, 2, 700, 144), (1100, 250, 3, 1200, 216)]
+    windows.append((1600, 50, 4, 1700, 288))
+    for start, raw_base, delta, note_t, kw in windows:
+        for step in range(5):
+            t = start + step * 50
+            entries.append(_did_entry(base, t, "watch", "2A70", raw_base + delta * step))
+        entries.append(_note_entry(base, note_t + 1, f"{kw} kw"))
+
+    data = cx.analyze_capture(entries)
+    matches = cx.match_notes(data)["charge_power"]
+    deriv = next(
+        m for m in matches if m.derivative and m.width == 2 and m.offset == 0 and not m.signed
+    )
+    assert deriv.did == "2A70"
+    assert deriv.r == pytest.approx(1.0)
+    assert deriv.a == pytest.approx(1.0)
+    assert deriv.b == pytest.approx(0.0, abs=1e-6)
+    assert deriv.n == 4
+
+    # A derivative match never names the DID in the draft profile - the
+    # field itself is an energy counter, not the power value the note
+    # describes.
+    assert cx.named_candidates({"charge_power": matches}) == {}
+
+    report_lines = cx._render_note_matches({"charge_power": matches}, data.notes)
+    deriv_line = next(
+        line for line in report_lines if "offset 0, width 2, unsigned" in line and "d/dt" in line
+    )
+    assert "candidate" not in deriv_line
 
 
 def test_derive_notes_need_three_with_two_distinct_values(tmp_path: Path) -> None:

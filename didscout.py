@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import difflib
 import gzip
 import json
 import math
@@ -2991,16 +2992,18 @@ DERIVE_RESPONSE_HEADER_PATTERN = re.compile(r"ATCRA(18DAF1[0-9A-F]{2}|[0-9A-F]{3
 DERIVE_DID_COMMAND_PATTERN = re.compile(r"22([0-9A-F]{4})")
 CONDITIONAL_STATUSES = frozenset({"NRC 22 conditionsNotCorrect", "NRC 33 securityAccessDenied"})
 
-# Typed-note ground truth: a word/number pair ("soc 54", "soc: 54", "soc=54",
-# "soc54") or a bare number with a unit stuck directly to it ("54%"). A unit
-# right after a number with a preceding word is just dropped, not a key.
-NOTE_PAIR_PATTERN = re.compile(
-    r"(?:(?P<word>[a-zA-Z]+)\s*[:=]?\s*)?"
-    r"(?P<num>\d+(?:[.,]\d+)?)"
-    r"(?P<unit>%|kw|km|\N{DEGREE SIGN}c|c|v|a)?"
-    r"(?![a-zA-Z])",
-    re.IGNORECASE,
+# Typed-note ground truth, tokenized into numbers and words: a number may be
+# preceded by context words ("soc 54"), followed by them ("54 soc", "176 km
+# rest") or have a unit glued directly to it ("89kw", "54%") - the words on
+# either side, plus a glued unit, resolve to a canonical key via
+# NOTE_KEY_KEYWORDS/_canonical_note_key below. ':'/'=' between a word and a
+# number are just separators.
+NOTE_TOKEN_PATTERN = re.compile(
+    r"(?P<num>\d+(?:[.,]\d+)?)(?P<unit>[a-zA-Z%\N{DEGREE SIGN}]+)?|(?P<word>[A-Za-zÄÖÜäöüß/]+)",
 )
+# Bare number+unit with no other context word - preserved for backward
+# compatibility with readings that carry no other hint (e.g. a lone "54%").
+# Anything with an actual keyword match (NOTE_KEY_KEYWORDS) takes priority.
 NOTE_UNIT_KEYS: dict[str, str] = {
     "%": "percent",
     "kw": "kw",
@@ -3010,6 +3013,27 @@ NOTE_UNIT_KEYS: dict[str, str] = {
     "v": "v",
     "a": "a",
 }
+# Canonical note keys and the words (German/English, full or abbreviated)
+# that identify them - fuzzy-matched per token (see _word_matches) so a typo
+# like "sooc" or "reichweote" still resolves. A multi-word phrase (contains a
+# space) only matches as an adjacent run and always wins over a single-word
+# match (see _canonical_note_key).
+NOTE_KEY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "soc": ("so", "soc", "sooc", "ladestand", "state of charge"),
+    "range": ("reichweite", "rest", "restreichweite", "reichw", "range"),
+    "battery_temp": ("batt", "battemp", "batterietemp", "akku", "battery temp"),
+    "outside_temp": ("aussen", "aussentemp", "außentemperatur", "outside"),
+    "charge_power": ("ladeleistung", "ladung", "leistung", "kw"),
+    "odometer": ("km stand", "kmstand", "kilometerstand", "odometer"),
+    "speed": ("kmh", "km/h"),
+}
+# "max"/"maximal" next to any charge_power word always means max_charge_power,
+# regardless of which charge_power keyword triggered it.
+NOTE_MAX_WORDS = ("max", "maximal")
+# A bare number next to the word "km" (not "kmh") is the odometer only if it
+# has the digit count a real odometer reading would have.
+NOTE_ODOMETER_DIGITS = (5, 6)
+NOTE_FUZZY_MIN_RATIO = 0.8
 NOTE_MIN_NOTES = 3
 NOTE_MIN_DISTINCT_VALUES = 2
 NOTE_STALE_SECONDS = 15 * 60.0
@@ -3023,25 +3047,94 @@ NOTE_CANDIDATE_FIELDS: tuple[tuple[int, bool], ...] = (
 )
 
 
+def _word_matches(word: str, keyword: str) -> bool:
+    """Exact match, or a fuzzy one (difflib, ratio >= NOTE_FUZZY_MIN_RATIO) -
+    only attempted for words of at least 3 characters, so a short word like
+    "km" can never accidentally fuzzy-match an unrelated keyword like
+    "kmh"."""
+    if word == keyword:
+        return True
+    if len(word) < 3 or len(keyword) < 3:
+        return False
+    return difflib.SequenceMatcher(None, word, keyword).ratio() >= NOTE_FUZZY_MIN_RATIO
+
+
+def _phrase_matches(words: list[str], phrase: str) -> bool:
+    tokens = phrase.split()
+    if len(tokens) < 2:
+        return False
+    return any(
+        all(_word_matches(words[i + j], tokens[j]) for j in range(len(tokens)))
+        for i in range(len(words) - len(tokens) + 1)
+    )
+
+
+def _canonical_note_key(words: list[str]) -> str | None:
+    """Maps a typed note's context words to one of NOTE_KEY_KEYWORDS's
+    canonical keys, tolerating typos (see _word_matches). "max"/"maximal"
+    together with any charge_power word always means max_charge_power; a
+    multi-word keyword phrase, if it matches as an adjacent run, always wins
+    over a single-word one."""
+    if any(_word_matches(w, m) for w in words for m in NOTE_MAX_WORDS) and any(
+        _word_matches(w, kw) for w in words for kw in NOTE_KEY_KEYWORDS["charge_power"]
+    ):
+        return "max_charge_power"
+    for key, keywords in NOTE_KEY_KEYWORDS.items():
+        if any(_phrase_matches(words, kw) for kw in keywords if " " in kw):
+            return key
+    for key, keywords in NOTE_KEY_KEYWORDS.items():
+        for keyword in keywords:
+            if " " not in keyword and any(_word_matches(w, keyword) for w in words):
+                return key
+    return None
+
+
 def parse_note(text: str) -> list[tuple[str, float]]:
-    """Extracts (key, value) ground-truth pairs typed during `record` -
-    "soc 54", "soc: 54,5", "soc=54", "soc54", or a bare "54%" (the unit
-    becomes the key, see NOTE_UNIT_KEYS). A word that is itself a phase
-    marker (see MARKER_PATTERNS) is never a key; anything else that doesn't
-    match is silently ignored."""
+    """Extracts (key, value) ground-truth pairs typed during `record` - a
+    number with context words before it ("soc 54", "soc: 54,5", "soc=54",
+    "soc54"), after it ("54 soc", "176 km rest", "14 batt temp"), or a unit
+    glued directly to it ("89kw", "100kmh", "54%"); typos in the words
+    resolve via NOTE_KEY_KEYWORDS/_canonical_note_key. A bare 5-6 digit
+    number next to "km" is always the odometer (NOTE_ODOMETER_DIGITS). A
+    word that is itself a phase marker (MARKER_PATTERNS) never contributes to
+    a key; a number with no usable context - not even a bare unit
+    (NOTE_UNIT_KEYS) - is silently ignored."""
+    tokens = list(NOTE_TOKEN_PATTERN.finditer(text))
     pairs: list[tuple[str, float]] = []
-    for match in NOTE_PAIR_PATTERN.finditer(text):
-        word = match.group("word")
-        if word is not None and any(p.search(word) for p in MARKER_PATTERNS.values()):
+    for i, token in enumerate(tokens):
+        if token.group("num") is None:
             continue
-        if word is not None:
-            key = word.lower()
-        else:
-            unit = match.group("unit")
-            if unit is None:
-                continue
-            key = NOTE_UNIT_KEYS[unit.lower()]
-        pairs.append((key, float(match.group("num").replace(",", "."))))
+        value = float(token.group("num").replace(",", "."))
+        unit = token.group("unit")
+        forward: list[str] = [unit.lower()] if unit else []
+        j = i + 1
+        while j < len(tokens) and tokens[j].group("word") is not None:
+            forward.append(tokens[j].group("word").lower())
+            j += 1
+        backward: list[str] = []
+        k = i - 1
+        while k >= 0 and tokens[k].group("word") is not None:
+            backward.insert(0, tokens[k].group("word").lower())
+            k -= 1
+        words = [
+            w for w in backward + forward if not any(p.search(w) for p in MARKER_PATTERNS.values())
+        ]
+        if not words:
+            continue
+
+        if (
+            "km" in words
+            and value == int(value)
+            and NOTE_ODOMETER_DIGITS[0] <= len(str(int(value))) <= NOTE_ODOMETER_DIGITS[1]
+        ):
+            pairs.append(("odometer", value))
+            continue
+
+        key = _canonical_note_key(words)
+        if key is None and unit is not None and words == [unit.lower()]:
+            key = NOTE_UNIT_KEYS.get(unit.lower())
+        if key is not None:
+            pairs.append((key, value))
     return pairs
 
 
@@ -3319,6 +3412,10 @@ class NoteMatch:
     b: float
     rmse: float
     n: int
+    # True if this candidate matched the note against the field's time
+    # derivative (per hour) rather than its raw value - see
+    # DERIVATIVE_CANDIDATE_KEYWORD and _derivative_at.
+    derivative: bool = False
 
 
 def _holding_sample(samples: list[DidSample], t: float, max_age: float) -> DidSample | None:
@@ -3347,6 +3444,32 @@ def _lstsq_fit(xs: list[float], ys: list[float]) -> tuple[float, float, float] |
     b = mean_y - a * mean_x
     rmse = math.sqrt(sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys, strict=True)) / n)
     return a, b, rmse
+
+
+# Charging power never shows on its own curve - it tracks how fast an energy
+# field moves, not any field's absolute value - so a note about it (or any
+# derived "max" variant) is also matched against each candidate field's time
+# derivative, not just its raw value.
+DERIVATIVE_CANDIDATE_KEYWORD = "power"
+DERIV_WINDOW_SECONDS = 150.0
+DERIV_MIN_SAMPLES = 3
+
+
+def _derivative_at(
+    samples: list[DidSample], offset: int, width: int, signed: bool, t: float
+) -> float | None:
+    """Per-hour rate of change of one byte field around `t`, from a local
+    least-squares fit over the samples within DERIV_WINDOW_SECONDS of it -
+    None if fewer than DERIV_MIN_SAMPLES fall in that window."""
+    window = [
+        (s.t, float(int.from_bytes(s.payload[offset : offset + width], "big", signed=signed)))
+        for s in samples
+        if abs(s.t - t) <= DERIV_WINDOW_SECONDS and len(s.payload) >= offset + width
+    ]
+    if len(window) < DERIV_MIN_SAMPLES:
+        return None
+    fit = _lstsq_fit([w[0] for w in window], [w[1] for w in window])
+    return fit[0] * 3600.0 if fit is not None else None
 
 
 def match_notes(data: DerivedData) -> dict[str, list[NoteMatch]]:
@@ -3385,15 +3508,48 @@ def match_notes(data: DerivedData) -> dict[str, list[NoteMatch]]:
                             )
                             xs.append(float(raw))
                             ys.append(note.value)
-                        if len(xs) < 3 or len(set(xs)) <= 1:
+                        if len(xs) >= 3 and len(set(xs)) > 1:
+                            r = _pearson(xs, ys)
+                            fit = _lstsq_fit(xs, ys)
+                            if r is not None and fit is not None:
+                                a, b, rmse = fit
+                                candidates.append(
+                                    NoteMatch(
+                                        label, did, offset, width, signed, r, a, b, rmse, len(xs)
+                                    )
+                                )
+
+                        if DERIVATIVE_CANDIDATE_KEYWORD not in key.lower():
                             continue
-                        r = _pearson(xs, ys)
-                        fit = _lstsq_fit(xs, ys)
-                        if r is None or fit is None:
+                        dxs: list[float] = []
+                        dys: list[float] = []
+                        for note in notes:
+                            deriv = _derivative_at(samples, offset, width, signed, note.t)
+                            if deriv is None:
+                                continue
+                            dxs.append(deriv)
+                            dys.append(note.value)
+                        if len(dxs) < 3 or len(set(dxs)) <= 1:
                             continue
-                        a, b, rmse = fit
+                        dr = _pearson(dxs, dys)
+                        dfit = _lstsq_fit(dxs, dys)
+                        if dr is None or dfit is None:
+                            continue
+                        da, db, drmse = dfit
                         candidates.append(
-                            NoteMatch(label, did, offset, width, signed, r, a, b, rmse, len(xs))
+                            NoteMatch(
+                                label,
+                                did,
+                                offset,
+                                width,
+                                signed,
+                                dr,
+                                da,
+                                db,
+                                drmse,
+                                len(dxs),
+                                derivative=True,
+                            )
                         )
         candidates.sort(key=lambda c: (-abs(c.r), c.rmse))
         results[key] = candidates[:5]
@@ -3407,7 +3563,11 @@ def named_candidates(matches: dict[str, list[NoteMatch]]) -> dict[tuple[str, str
     best: dict[tuple[str, str], tuple[str, float]] = {}
     for key, top in matches.items():
         for m in top:
-            if abs(m.r) < NOTE_NAME_MIN_R or m.n < NOTE_NAME_MIN_NOTES:
+            # A derivative match means the field itself is an energy/distance
+            # counter, not the rate the note describes - naming the DID after
+            # the note's key would be misleading, so only a direct match
+            # names it in the draft (the derivative still shows in the report).
+            if m.derivative or abs(m.r) < NOTE_NAME_MIN_R or m.n < NOTE_NAME_MIN_NOTES:
                 continue
             did_key = (m.label, m.did)
             current = best.get(did_key)
@@ -3548,12 +3708,13 @@ def _render_note_matches(matches: dict[str, list[NoteMatch]], notes: list[NoteSa
             continue
         for m in top:
             signedness = "signed" if m.signed else "unsigned"
-            named = abs(m.r) >= NOTE_NAME_MIN_R and m.n >= NOTE_NAME_MIN_NOTES
+            named = not m.derivative and abs(m.r) >= NOTE_NAME_MIN_R and m.n >= NOTE_NAME_MIN_NOTES
             suffix = f' - named "{key} candidate" in the draft' if named else ""
+            quantity = "d/dt raw" if m.derivative else "raw"
             lines.append(
                 f"- {m.label} / DID {m.did} / field (offset {m.offset}, width {m.width}, "
                 f"{signedness}): r={m.r:+.3f}, "
-                f"display ≈ {m.a:.4f}·raw {'-' if m.b < 0 else '+'} {abs(m.b):.4f}, "
+                f"display ≈ {m.a:.4f}·{quantity} {'-' if m.b < 0 else '+'} {abs(m.b):.4f}, "
                 f"RMSE={m.rmse:.3f}, n={m.n}{suffix}"
             )
         lines.append("")

@@ -56,8 +56,8 @@ OBDonUDS, 11-bit and 29-bit manufacturer ECUs - the latter with VAG's own
 logging every known value and discovering more DIDs on every known ECU while
 the vehicle is stationary - discovery pauses the moment it's moving again.
 It also re-probes for ECUs that only wake in some vehicle state (e.g. a
-charger ECU while charging) on every phase change and every 30 minutes
-stationary, folding any newly found one straight into the running session.
+charger ECU while charging) whenever the vehicle comes to a stop and every
+15 minutes while stationary - never while moving - folding any newly found one straight into the running session.
 Watch polling backs off an unchanged value's interval over time and the log
 only records a read when its value changes (plus an occasional keep-alive),
 so a long stationary stretch doesn't drown the capture in repeats. Press

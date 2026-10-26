@@ -2336,7 +2336,7 @@ def test_rediscovery_on_phase_change_adds_a_newly_awake_ecu(
     assert any(e["stage"].startswith("rediscover") for e in entries)
 
 
-def test_rediscovery_every_30_min_stationary_skips_known_ecus(
+def test_rediscovery_every_15_min_stationary_skips_known_ecus(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", [0x710, 0x720, 0x730])
@@ -3515,3 +3515,33 @@ def test_record_terminates_inhibit_process_on_unhandled_cancellation(
 
     assert len(procs) == 1
     assert procs[0].terminated is True
+
+
+@pytest.mark.parametrize(
+    ("phase", "changed", "expected"),
+    [("moving", True, False), ("stationary", True, True), ("moving", False, False)],
+)
+def test_rediscovery_never_starts_while_moving(
+    phase: str, changed: bool, expected: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[bool] = []
+
+    async def fake_rediscover(*_args: object) -> None:
+        calls.append(True)
+
+    monkeypatch.setattr(cx, "_record_rediscover", fake_rediscover)
+    state = cx.RunState.new("vehicle", "fake")
+    loop_state = cx.build_record_loop_state(None, state)
+    loop_state.phase = phase
+    loop_state.last_rediscover = time.monotonic()
+
+    asyncio.run(
+        cx._record_maybe_rediscover(
+            None,  # type: ignore[arg-type]
+            state,
+            tmp_path / "state.json",
+            loop_state,
+            changed,
+        )
+    )
+    assert bool(calls) is expected

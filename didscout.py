@@ -2583,7 +2583,7 @@ RECORD_WATCH_BACKOFF_CAP = 1800.0  # seconds
 RECORD_WATCH_KEEPALIVE_SECONDS = 900.0
 # While stationary, re-probe for ECUs that only wake in some vehicle states
 # (e.g. a charger ECU while charging) even without a phase change.
-RECORD_REDISCOVER_INTERVAL = 1800.0  # seconds
+RECORD_REDISCOVER_INTERVAL = 900.0  # seconds
 
 
 def _record_update_backoff(
@@ -2746,7 +2746,10 @@ async def _record_maybe_rediscover(
         loop_state.phase == "stationary"
         and time.monotonic() - loop_state.last_rediscover >= RECORD_REDISCOVER_INTERVAL
     )
-    if changed or due_for_interval:
+    # Probing hundreds of unknown diagnostic ids is discovery traffic, so like
+    # DID discovery it never runs while the vehicle is moving.
+    entered_stationary = changed and loop_state.phase == "stationary"
+    if entered_stationary or due_for_interval:
         await _record_rediscover(link, state, state_path, loop_state)
 
 

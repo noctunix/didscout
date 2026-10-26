@@ -210,6 +210,23 @@ def test_valid_profile_loads(tmp_path: Path) -> None:
     profile = _load(tmp_path, VALID_PROFILE_TOML)
     assert profile.id == "testprofile"
     assert profile.modules[0].dids[0].did == "2AB8"
+    assert profile.address_schemes == []
+
+
+def test_profile_accepts_known_address_scheme(tmp_path: Path) -> None:
+    text = VALID_PROFILE_TOML.replace(
+        'protocol = "6"', 'protocol = "6"\naddress_schemes = ["vag-29bit"]'
+    )
+    profile = _load(tmp_path, text)
+    assert profile.address_schemes == ["vag-29bit"]
+
+
+def test_profile_rejects_unknown_address_scheme(tmp_path: Path) -> None:
+    text = VALID_PROFILE_TOML.replace(
+        'protocol = "6"', 'protocol = "6"\naddress_schemes = ["made-up-scheme"]'
+    )
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, text)
 
 
 def test_resolve_profile_finds_by_id_in_profiles_dir() -> None:
@@ -1469,6 +1486,47 @@ def test_check_ecus11_allowed_is_read_only_and_four_dids_only() -> None:
             cx.check_ecus11_allowed(cmd)
 
 
+def test_check_ecus29_allowed_is_read_only_and_four_dids_only() -> None:
+    allowed = (
+        "ATSP7",
+        "ATAR",
+        "ATSH18DA10F1",
+        "ATCRA18DAF110",
+        "ATFCSH18DA10F1",
+        "22F187",
+        "22F189",
+        "22F191",
+        "22F197",
+    )
+    assert [cx.check_ecus29_allowed(cmd) for cmd in allowed] == list(allowed)
+    for cmd in ("22F18C", "22F190", "22F802", "ATSH17FC0010", "ATCRA17FE0010", "2EF44900"):
+        with pytest.raises(cx.ForbiddenCommandError):
+            cx.check_ecus29_allowed(cmd)
+
+
+def test_check_vag29_allowed_accepts_only_vag_headers_and_read_dids() -> None:
+    allowed = ("ATSP7", "ATAR", "ATSH17FC0010", "ATFCSH17FC0010", "ATCRA17FE0010", "222AB8")
+    assert [cx.check_vag29_allowed(cmd) for cmd in allowed] == list(allowed)
+    for cmd in ("22F190", "22F802", "ATSH18DA10F1", "ATCRA18DAF110", "2EF44900"):
+        with pytest.raises(cx.ForbiddenCommandError):
+            cx.check_vag29_allowed(cmd)
+
+
+def test_vag_headers_are_rejected_by_every_other_validator() -> None:
+    for validator in (
+        cx.check_allowed,
+        cx.check_sweep_allowed,
+        cx.check_ecus11_allowed,
+        cx.check_ecus29_allowed,
+        cx.check_identify_allowed,
+        cx.check_obduds_allowed,
+        cx.check_mode01_allowed,
+    ):
+        for cmd in ("ATSH17FC0010", "ATFCSH17FC0010", "ATCRA17FE0010"):
+            with pytest.raises(cx.ForbiddenCommandError):
+                validator(cmd)
+
+
 def test_run_state_round_trip_and_atomic_write(tmp_path: Path) -> None:
     state = cx.RunState.new("vehicle", "AA:BB:CC:DD:EE:FF")
     state.mark_stage("adapter", "done")
@@ -1838,6 +1896,104 @@ def test_ecus11_discovery_finds_positive_and_negative_responders_and_ignores_sil
     assert ecus["705"]["identify"]["F189"].startswith("NRC")
 
 
+def test_ecus29_discovery_finds_fake_ecu_and_ignores_silence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "ECU29_IDS", ["0F", "10", "11"])
+    current_header: dict[str, str] = {"value": ""}
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    identify_payloads = {
+        "F187": b"\x62\xf1\x87\x01",
+        "F189": b"\x62\xf1\x89\x01",
+        "F191": b"\x62\xf1\x91\x01",
+        "F197": b"\x62\xf1\x97test",
+    }
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("ATSH"):
+            current_header["value"] = cmd[4:]
+            return b"OK\r>"
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if current_header["value"] == "18DA10F1" and cmd[2:] in identify_payloads:
+            return hex_reply("18DAF110", identify_payloads[cmd[2:]])
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    async def scenario() -> cx.RunState:
+        state = cx.RunState.new("vehicle", "fake")
+        state.set_result("obduds", {})
+        async with cx.connect_adapter("fake", False, tmp_path / "ecus29.jsonl", "vehicle") as link:
+            assert link is not None
+            await cx._inventory_ecus29(link, state, None)
+        return state
+
+    state = asyncio.run(scenario())
+    ecus29 = state.result("ecus29")
+    assert isinstance(ecus29, dict)
+    assert set(ecus29) == {"10"}  # 0F and 11 stayed silent
+    assert ecus29["10"]["response"] == "18DAF110"
+    assert ecus29["10"]["identify"]["F189"] == "OK"
+    # No profile given: the VAG scheme never ran at all.
+    assert state.result("vag29") is None
+
+
+def test_ecus29_vag_scheme_runs_only_when_profile_opts_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "ECU29_IDS", [])
+    monkeypatch.setattr(cx, "VAG29_IDS", ["05"])
+    current_header: dict[str, str] = {"value": ""}
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("ATSH"):
+            current_header["value"] = cmd[4:]
+            return b"OK\r>"
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if current_header["value"] == "17FC0005" and cmd == "22F189":
+            return hex_reply("17FE0005", b"\x62\xf1\x89\x01")
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    async def scenario(profile: cx.Profile | None) -> cx.RunState:
+        state = cx.RunState.new("vehicle", "fake")
+        state.set_result("obduds", {})
+        async with cx.connect_adapter("fake", False, tmp_path / "vag29.jsonl", "vehicle") as link:
+            assert link is not None
+            await cx._inventory_ecus29(link, state, profile)
+        return state
+
+    assert asyncio.run(scenario(None)).result("vag29") is None
+
+    profile = cx.Profile(
+        schema=1,
+        id="p",
+        name="n",
+        description="d",
+        protocol="7",
+        vehicles=["v"],
+        sources=[],
+        modules=[],
+        address_schemes=["vag-29bit"],
+    )
+    vag29 = asyncio.run(scenario(profile)).result("vag29")
+    assert isinstance(vag29, dict)
+    assert set(vag29) == {"05"}
+    assert vag29["05"]["response"] == "17FE0005"
+    assert vag29["05"]["identify"]["F189"] == "OK"
+
+
 def test_stretch_watch_intervals_keeps_speed_and_scales_the_rest() -> None:
     entries = [("speed", 2.0, True), ("a", 1.0, False), ("b", 1.0, False)]
     # rate = 1/1 + 1/1 = 2.0 reads/s; stretched by 2x to fit a 1.0 limit.
@@ -1909,6 +2065,106 @@ def test_decode_speed_from_mode01_and_obduds() -> None:
     assert cx.decode_speed("010D", failed_ex, None) is None
 
 
+def _ok_ex(response: str) -> cx.Exchange:
+    return cx.Exchange("22AB", response, "OK", "", 0.0)
+
+
+def _result_dict(state: cx.RunState, key: str) -> dict[str, object]:
+    result = state.result(key)
+    assert isinstance(result, dict)
+    return result
+
+
+def test_adaptive_backoff_doubles_after_three_unchanged_caps_and_resets() -> None:
+    key = ("m", "22AB")
+    entry = cx.RecordWatch("m", "22AB", 10.0, "watch")
+    loop_state = cx.RecordLoopState(modules={}, speed_key=None, by_key={key: entry}, next_due={})
+    loop_state.watch_interval[key] = entry.base_interval
+
+    cx._record_update_backoff(loop_state, key, entry, _ok_ex("same"))
+    assert loop_state.watch_interval[key] == 10.0  # first read just establishes the baseline
+
+    for _ in range(2):
+        cx._record_update_backoff(loop_state, key, entry, _ok_ex("same"))
+    assert loop_state.watch_interval[key] == 10.0  # only 2 consecutive unchanged reads so far
+
+    cx._record_update_backoff(loop_state, key, entry, _ok_ex("same"))
+    assert loop_state.watch_interval[key] == 20.0  # 3rd consecutive unchanged read: doubled
+
+    for _ in range(10):
+        cx._record_update_backoff(loop_state, key, entry, _ok_ex("same"))
+    assert loop_state.watch_interval[key] == cx.RECORD_WATCH_BACKOFF_CAP
+
+    cx._record_update_backoff(loop_state, key, entry, _ok_ex("different"))
+    assert loop_state.watch_interval[key] == 10.0  # any change resets to base
+    assert loop_state.watch_unchanged[key] == 0
+
+    for _ in range(3):
+        cx._record_update_backoff(loop_state, key, entry, _ok_ex("different"))
+    assert loop_state.watch_interval[key] == 20.0  # 3 consecutive unchanged reads again
+    # a non-OK read is a change too, same as a different payload
+    cx._record_update_backoff(
+        loop_state, key, entry, cx.Exchange("22AB", "NO DATA", "NO DATA", "", 0.0)
+    )
+    assert loop_state.watch_interval[key] == 10.0
+
+
+def test_phase_change_resets_watch_backoff_but_exempts_speed() -> None:
+    speed_key = ("m", "010D")
+    watch_key = ("m", "22AB")
+    by_key = {
+        speed_key: cx.RecordWatch("m", "010D", 5.0, "speed", True),
+        watch_key: cx.RecordWatch("m", "22AB", 10.0, "watch"),
+    }
+    loop_state = cx.RecordLoopState(
+        modules={},
+        speed_key=speed_key,
+        by_key=by_key,
+        next_due={},
+        watch_interval={speed_key: 40.0, watch_key: 80.0},
+        watch_unchanged={watch_key: 5},
+        speed_value=0,
+        speed_fetched=time.monotonic(),
+    )
+
+    async def write(_data: bytes) -> None:
+        pass
+
+    link = cx.AdapterLink(cx.ElmSession(write, 20), lambda ex, stage, module=None: None)
+
+    changed = cx._record_apply_phase(link, loop_state)  # moving (default) -> stationary
+    assert changed is True
+    assert loop_state.watch_interval[watch_key] == 10.0
+    assert loop_state.watch_unchanged[watch_key] == 0
+    assert loop_state.watch_interval[speed_key] == 40.0  # speed is exempt
+
+    changed_again = cx._record_apply_phase(link, loop_state)
+    assert changed_again is False  # no phase change this time
+
+
+def test_watch_should_log_first_read_change_and_keepalive() -> None:
+    key = ("m", "22AB")
+    loop_state = cx.RecordLoopState(modules={}, speed_key=None, by_key={}, next_due={})
+
+    ex1 = _ok_ex("resp1")
+    assert cx._record_watch_should_log(loop_state, key, ex1, now=1000.0) is True
+
+    loop_state.watch_last_logged[key] = ("OK", "resp1")
+    loop_state.watch_last_log_time[key] = 1000.0
+
+    # Unchanged, well before the keep-alive interval: not written.
+    assert cx._record_watch_should_log(loop_state, key, ex1, now=1000.0 + 10.0) is False
+
+    # A changed response is always written.
+    ex2 = _ok_ex("resp2")
+    assert cx._record_watch_should_log(loop_state, key, ex2, now=1000.0 + 10.0) is True
+
+    # Unchanged, but the keep-alive interval has elapsed since the last
+    # written entry.
+    keepalive_due = 1000.0 + cx.RECORD_WATCH_KEEPALIVE_SECONDS
+    assert cx._record_watch_should_log(loop_state, key, ex1, now=keepalive_due) is True
+
+
 def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_conditional(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1919,6 +2175,10 @@ def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_
     # reads are instead forced on demand by setting next_due directly, so the
     # test doesn't race a real interval against fake-transport command overhead.
     monkeypatch.setattr(cx, "RECORD_SPEED_INTERVAL", 60.0)
+    # This test changes phase several times, each of which now triggers a
+    # rediscovery scan - keep the candidate ranges tiny so it stays fast.
+    monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", [0x710])
+    monkeypatch.setattr(cx, "ECU29_IDS", [])
 
     kmh = {"value": 0}
     did1005_attempts = {"n": 0}
@@ -2010,6 +2270,216 @@ def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_
     assert watch_entries and all(e["module"] == "ecus11:710" for e in watch_entries)
 
 
+def test_rediscovery_on_phase_change_adds_a_newly_awake_ecu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", [0x710, 0x720])
+    monkeypatch.setattr(cx, "ECU29_IDS", [])
+    monkeypatch.setattr(cx, "VAG29_IDS", [])
+
+    current_header: dict[str, str] = {"value": ""}
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("ATSH"):
+            current_header["value"] = cmd[4:]
+            return b"OK\r>"
+        if cmd == "010D":
+            return hex_reply("7E8", bytes([0x41, 0x0D, 0x00]))
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if (
+            current_header["value"] == "720"
+            and cmd.startswith("22")
+            and cmd[2:] in cx.IDENTIFY_DIDS
+        ):
+            return hex_reply("721", bytes([0x62, int(cmd[2:4], 16), int(cmd[4:6], 16), 0x01]))
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": ["6"], "chosen": "6"})
+    state.set_result("mode01", {"supported_pids": ["0D"], "protocol": "6"})
+    state.set_result("ecus11", {})
+    state.set_result("ecus29", {})
+    state.set_result("obduds", {})
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            loop_state = cx.build_record_loop_state(None, state)
+            assert "ecus11:720" not in loop_state.modules
+
+            # First tick: speed reads 0 km/h, a moving -> stationary phase
+            # change, which triggers rediscovery right away.
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            assert loop_state.phase == "stationary"
+            assert "ecus11:720" in loop_state.modules
+            # The scans left the adapter's state unknown to the scheduler,
+            # same as right after a reconnect.
+            assert loop_state.current_module_key is None
+
+    asyncio.run(scenario())
+
+    ecus11 = state.result("ecus11")
+    assert isinstance(ecus11, dict)
+    assert set(ecus11) == {"720"}
+    assert ecus11["720"]["response"] == "721"
+
+    entries = [json.loads(line) for line in (tmp_path / "capture.jsonl").read_text().splitlines()]
+    assert any(e["stage"].startswith("rediscover") for e in entries)
+
+
+def test_rediscovery_every_30_min_stationary_skips_known_ecus(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", [0x710, 0x720, 0x730])
+    monkeypatch.setattr(cx, "ECU29_IDS", [])
+    monkeypatch.setattr(cx, "VAG29_IDS", [])
+    # Patched clock: rather than fake asyncio's own time source (which would
+    # also freeze its internal command timeouts), the elapsed-time check is
+    # driven by rewinding loop_state.last_rediscover directly below.
+    monkeypatch.setattr(cx, "RECORD_REDISCOVER_INTERVAL", 50.0)
+
+    current_header: dict[str, str] = {"value": ""}
+    awake_730 = {"value": False}
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("ATSH"):
+            current_header["value"] = cmd[4:]
+            return b"OK\r>"
+        if cmd == "010D":
+            return hex_reply("7E8", bytes([0x41, 0x0D, 0x00]))
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        header = current_header["value"]
+        if (
+            cmd.startswith("22")
+            and cmd[2:] in cx.IDENTIFY_DIDS
+            and (header == "720" or (header == "730" and awake_730["value"]))
+        ):
+            responder_header = "721" if header == "720" else "731"
+            payload = bytes([0x62, int(cmd[2:4], 16), int(cmd[4:6], 16), 0x01])
+            return hex_reply(responder_header, payload)
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": ["6"], "chosen": "6"})
+    state.set_result("mode01", {"supported_pids": ["0D"], "protocol": "6"})
+    state.set_result("ecus11", {})
+    state.set_result("ecus29", {})
+    state.set_result("obduds", {})
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            loop_state = cx.build_record_loop_state(None, state)
+            speed_key = ("mode01", "010D")
+
+            # Phase change moving -> stationary: first rediscovery, finds 720
+            # only (730 isn't awake yet).
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            assert loop_state.phase == "stationary"
+            assert set(_result_dict(state, "ecus11")) == {"720"}
+
+            # 730 wakes up, but not enough time has passed yet: still
+            # stationary, no phase change, interval not elapsed - skipped.
+            awake_730["value"] = True
+            loop_state.next_due[speed_key] = time.monotonic()
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            assert set(_result_dict(state, "ecus11")) == {"720"}
+
+            # Now the interval has elapsed while remaining stationary:
+            # rediscovery runs again, skips the already-known 720, and finds
+            # the newly awake 730.
+            loop_state.last_rediscover = time.monotonic() - cx.RECORD_REDISCOVER_INTERVAL - 1.0
+            loop_state.next_due[speed_key] = time.monotonic()
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            assert set(_result_dict(state, "ecus11")) == {"720", "730"}
+            assert "ecus11:730" in loop_state.modules
+
+    asyncio.run(scenario())
+
+
+def test_discovery_batch_writes_summary_and_only_interesting_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_DISCOVERY_BATCH", 4)
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if cmd == "221000":
+            return hex_reply("77A", bytes([0x62, 0x10, 0x00, 0xAA]))
+        if cmd == "221001":
+            return b"NO DATA\r>"
+        if cmd == "221002":
+            return hex_reply("77A", bytes([0x7F, 0x22, 0x31]))  # NRC 31 requestOutOfRange
+        if cmd == "221003":
+            return hex_reply("77A", bytes([0x7F, 0x22, 0x22]))  # NRC 22 conditionsNotCorrect
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    module = cx.RecordModule(
+        key="mod",
+        protocol="6",
+        setup=[],
+        validator=cx.check_sweep_allowed,
+        responder="77A",
+        discover_ranges=[],
+    )
+    module.order = [0x1000, 0x1001, 0x1002, 0x1003]
+
+    state = cx.RunState.new("vehicle", "fake")
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> list[int]:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            return await cx.run_discovery_batch(link, module, state, state_path)
+
+    newly_found = asyncio.run(scenario())
+    assert newly_found == [0x1000]
+    assert module.conditional == {0x1003}
+
+    entries = [json.loads(line) for line in (tmp_path / "capture.jsonl").read_text().splitlines()]
+    discover_entries = [e for e in entries if e["stage"] == "discover-mod"]
+
+    summaries = [e for e in discover_entries if e["status"] == "SUMMARY"]
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary["command"] == "BATCH 1000-1003"
+    assert json.loads(summary["response"]) == {
+        "OK": 1,
+        "NO DATA": 1,
+        "NRC 31 requestOutOfRange": 1,
+        "NRC 22 conditionsNotCorrect": 1,
+    }
+
+    individual = [e for e in discover_entries if e["status"] != "SUMMARY"]
+    assert {e["command"] for e in individual} == {"221000", "221003"}
+
+
 def test_mode01_protocol_is_whichever_answered_mode01_not_the_profile(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2052,6 +2522,11 @@ def test_record_loop_switches_protocol_between_modules_without_redundant_atsp(
     monkeypatch.setattr(cx, "DISCOVERY_PRIORITY_RANGES", ())
     monkeypatch.setattr(cx, "DISCOVERY_FULL_RANGE", (0x1000, 0x1003))
     monkeypatch.setattr(cx, "RECORD_DISCOVERY_BATCH", 2)
+    # The speed source reads 0 km/h immediately, so the very first tick is
+    # already a moving -> stationary phase change and would otherwise trigger
+    # a full rediscovery scan here too - keep it a no-op for this test.
+    monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", [])
+    monkeypatch.setattr(cx, "ECU29_IDS", [])
 
     fake_protocol = {"value": "6"}
     atsp_sent: list[str] = []
@@ -2259,6 +2734,34 @@ def test_derive_classifies_constant_and_changing_dids(tmp_path: Path) -> None:
     assert "2A20" in report
 
 
+def test_derive_ignores_batch_summary_entries(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    entries = _synthetic_capture(base)
+    entries.append(
+        _capture_entry(
+            base,
+            9999,
+            "discover-profile:gateway",
+            "BATCH 2A50-2A53",
+            "SUMMARY",
+            json.dumps({"NO DATA": 3, "OK": 1}),
+            "profile:gateway",
+        )
+    )
+    _write_capture(run_dir, entries)
+
+    profile_path, _report_path = cx.derive(run_dir, vehicle="Test Car")
+    assert profile_path is not None
+    profile = cx.load_profile(profile_path)
+    module = next(m for m in profile.modules if m.id == "ecu-710")
+    by_did = {d.did: d for d in module.dids}
+    # The summary itself never names a found DID and must not be mistaken
+    # for one.
+    assert "2A50" not in by_did
+    assert by_did["2A20"].poll == "watch"
+
+
 def test_derive_detects_speed_correlation_and_stationary_rise(tmp_path: Path) -> None:
     base = datetime(2026, 10, 25, tzinfo=UTC)
     run_dir = tmp_path / "record_test"
@@ -2403,6 +2906,28 @@ def test_share_drops_response_for_transport_failures(tmp_path: Path) -> None:
             "uuid_in_response",
             lambda e: {**e, "response": "adapter 12345678-1234-5678-1234-567812345678"},
         ),
+        (
+            "summary_bad_command",
+            lambda e: {**e, "command": "BATCH abc", "status": "SUMMARY", "response": '{"OK": 1}'},
+        ),
+        (
+            "summary_non_dict_response",
+            lambda e: {
+                **e,
+                "command": "BATCH 1000-1003",
+                "status": "SUMMARY",
+                "response": "not json",
+            },
+        ),
+        (
+            "summary_non_int_value",
+            lambda e: {
+                **e,
+                "command": "BATCH 1000-1003",
+                "status": "SUMMARY",
+                "response": '{"OK": "one"}',
+            },
+        ),
     ],
 )
 def test_validate_share_rejects_each_violation(
@@ -2430,6 +2955,30 @@ def test_validate_share_accepts_a_clean_file(tmp_path: Path) -> None:
     _write_capture(run_dir, _synthetic_capture(base))
     share_path = cx.share(run_dir, vehicle="Test Car")
     cx.validate_share(share_path)  # must not raise
+
+
+def test_share_and_validate_share_accept_batch_summary_entries(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    run_dir = tmp_path / "record_test"
+    entries = [
+        _capture_entry(
+            base,
+            0,
+            "discover-profile:gateway",
+            "BATCH 2A50-2A53",
+            "SUMMARY",
+            json.dumps({"NO DATA": 3, "OK": 1}),
+            "profile:gateway",
+        ),
+    ]
+    _write_capture(run_dir, entries)
+    share_path = cx.share(run_dir, vehicle="Test Car")
+    cx.validate_share(share_path)  # must not raise
+
+    with gzip.open(share_path, "rt", encoding="utf-8") as handle:
+        body = [json.loads(line) for line in handle][1]
+    assert body["status"] == "SUMMARY"
+    assert json.loads(body["response"]) == {"NO DATA": 3, "OK": 1}
 
 
 @pytest.mark.parametrize(

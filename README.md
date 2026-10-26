@@ -51,12 +51,20 @@ uv run python didscout.py record
 ```
 
 It connects, runs a one-time vehicle inventory (adapter, protocol, mode-01,
-OBDonUDS, manufacturer ECUs), then keeps logging every known value and
-discovering more DIDs on every known ECU while the vehicle is stationary -
-discovery pauses the moment it's moving again. Press Ctrl-C when you're done
-(e.g. back home from a drive/charge). A dropped BLE connection reconnects with
-backoff and resumes where it left off; starting `record` again later resumes
-the same unfinished run automatically (`--new` to start fresh instead).
+OBDonUDS, 11-bit and 29-bit manufacturer ECUs - the latter with VAG's own
+29-bit scheme too, if the profile opts in via `address_schemes`), then keeps
+logging every known value and discovering more DIDs on every known ECU while
+the vehicle is stationary - discovery pauses the moment it's moving again.
+It also re-probes for ECUs that only wake in some vehicle state (e.g. a
+charger ECU while charging) on every phase change and every 30 minutes
+stationary, folding any newly found one straight into the running session.
+Watch polling backs off an unchanged value's interval over time and the log
+only records a read when its value changes (plus an occasional keep-alive),
+so a long stationary stretch doesn't drown the capture in repeats. Press
+Ctrl-C when you're done (e.g. back home from a drive/charge). A dropped BLE
+connection reconnects with backoff and resumes where it left off; starting
+`record` again later resumes the same unfinished run automatically (`--new`
+to start fresh instead).
 
 On Ctrl-C, `record` automatically runs `derive` and `share` (see below) on its
 own run directory and prints the resulting paths plus a one-line hint for how

@@ -135,6 +135,16 @@ German included). `CONTRIBUTING.md` lists the exact rules `validate_share` enfor
 uv run python didscout.py share logs/record_20260101_120000_vehicle --vehicle "my car"
 ```
 
+### Recordings from the Android app
+
+`derive`/`share` also accept a didscout-app recording directly - just point
+`RUN_DIR` at the obdbridge buffer file (`<session>.jsonl`) instead of a
+`record` run; the input kind is detected automatically. Its marker sidecar
+(`<session>.jsonl.markers.jsonl`), if present next to it, supplies phase
+markers, notes, events, and typed readings the same way a `record` session's
+own typed notes do. An app recording never runs discovery, so `derive` never
+writes a profile draft for one - only `report.md`.
+
 ## Contributing what you found
 
 Two ways, see `CONTRIBUTING.md` for the full guide:

@@ -1528,6 +1528,15 @@ async def sweep(
         session = link.session
         record = link.record
 
+        # Tracks every reply across the whole sweep (all responders, with
+        # --obduds-ecus) so a run where an ECU fell asleep mid-sweep can be
+        # flagged below, regardless of how many DIDs still answered before that.
+        sweep_status_counts: dict[str, int] = {}
+
+        def counting_sweep_record(ex: Exchange, stage: str, module: str | None = None) -> None:
+            sweep_status_counts[ex.status] = sweep_status_counts.get(ex.status, 0) + 1
+            record(ex, stage, module)
+
         if obduds_ecus:
             result = 0
             hits: list[tuple[str, str]] = []
@@ -1554,7 +1563,12 @@ async def sweep(
                         ecu = await obduds_select_responder(execute, responder, "setup")
                         hits.extend(
                             await sweep_range(
-                                session, record, start_i, end_i, f"sweep-{ecu}", responder
+                                session,
+                                counting_sweep_record,
+                                start_i,
+                                end_i,
+                                f"sweep-{ecu}",
+                                responder,
                             )
                         )
             except ProbeAbortedError as error:
@@ -1576,12 +1590,21 @@ async def sweep(
                 record(await session.run("ATFCSD300000"), "setup")
                 record(await session.run("ATFCSM1"), "setup")
 
-            hits = await sweep_range(session, record, start_i, end_i, responder=rax)
+            hits = await sweep_range(session, counting_sweep_record, start_i, end_i, responder=rax)
 
             if rax:
                 record(await session.run("ATFCSM0"), "cleanup")
             record(await session.run("ATAR"), "cleanup")
             record(await session.run("ATD"), "cleanup")
+
+        if result == 0 and _batch_is_asleep(sweep_status_counts, sum(sweep_status_counts.values())):
+            print(
+                "sweep: ECU stopped answering (NRC 11 serviceNotSupported on at least half the "
+                "replies) - it probably went to sleep or the vehicle was switched off; rerun "
+                "this range",
+                file=sys.stderr,
+            )
+            result = 3
     print(f"log: {log_path}")
     print(f"hits: {hits or '-'}")
     return result
@@ -2559,6 +2582,20 @@ def build_record_watch(
 
 
 DISCOVERY_SILENT_STATUSES = frozenset({"NO DATA", "NRC 31 requestOutOfRange"})
+# How long a module's discovery pauses after a batch where at least half the
+# replies were NRC 11 (serviceNotSupported) - the ECU has most likely gone to
+# sleep, so hammering it further is pointless until it wakes back up.
+RECORD_ASLEEP_PAUSE_SECONDS = 60.0
+
+
+def _batch_is_asleep(status_counts: dict[str, int], batch_size: int) -> bool:
+    """True if at least half of one discovery batch's replies were NRC 11
+    (serviceNotSupported) - the signature of an ECU that stopped answering,
+    typically because the vehicle itself was switched off."""
+    if batch_size == 0:
+        return False
+    nrc11 = sum(count for status, count in status_counts.items() if status.startswith("NRC 11"))
+    return nrc11 * 2 >= batch_size
 
 
 async def run_discovery_batch(
@@ -2566,29 +2603,51 @@ async def run_discovery_batch(
 ) -> list[int]:
     """Reads one batch (RECORD_DISCOVERY_BATCH DIDs) of `module`'s discovery
     work - its pending conditional retries first, else the next slice of its
-    scan order - persists the updated position/discovered/conditional set, and
-    returns the DIDs newly found OK in this batch. Writes an individual log
-    entry only for a status other than NO DATA/NRC 31 (the overwhelming
-    majority of a scan); every DID in the batch, found or not, is folded into
-    one trailing `BATCH <first>-<last>`/SUMMARY entry mapping status to
-    count, so the log stays readable without losing the full picture."""
-    if module.retry_queue:
-        batch, module.retry_queue = (
-            module.retry_queue[:RECORD_DISCOVERY_BATCH],
-            module.retry_queue[RECORD_DISCOVERY_BATCH:],
-        )
-    else:
-        batch = module.order[module.position : module.position + RECORD_DISCOVERY_BATCH]
-        module.position += len(batch)
+    scan order. If the batch looks asleep (_batch_is_asleep), it is logged as
+    a single ASLEEP summary, module progress does not advance, and the
+    module's discovery pauses for RECORD_ASLEEP_PAUSE_SECONDS; otherwise it
+    persists the updated position/discovered/conditional set and returns the
+    DIDs newly found OK. A normal batch writes an individual log entry only
+    for a status other than NO DATA/NRC 31 (the overwhelming majority of a
+    scan); every DID in it, found or not, is folded into one trailing
+    `BATCH <first>-<last>`/SUMMARY entry mapping status to count, so the log
+    stays readable without losing the full picture."""
+    from_retry = bool(module.retry_queue)
+    batch = (
+        module.retry_queue[:RECORD_DISCOVERY_BATCH]
+        if from_retry
+        else module.order[module.position : module.position + RECORD_DISCOVERY_BATCH]
+    )
 
     stage = f"discover-{module.key}"
-    newly_found: list[int] = []
     status_counts: dict[str, int] = {}
+    replies: list[tuple[int, Exchange]] = []
     for did in batch:
         ex = await link.execute_guarded(
             f"22{did:04X}", stage, module.validator, module.responder, module=module.key, log=False
         )
         status_counts[ex.status] = status_counts.get(ex.status, 0) + 1
+        replies.append((did, ex))
+
+    if _batch_is_asleep(status_counts, len(batch)):
+        summary = Exchange(
+            f"BATCH {batch[0]:04X}-{batch[-1]:04X}",
+            json.dumps(status_counts),
+            "ASLEEP",
+            datetime.now(UTC).isoformat(),
+            0.0,
+        )
+        link.record(summary, stage, module.key)
+        module.discovery_paused_until = time.monotonic() + RECORD_ASLEEP_PAUSE_SECONDS
+        return []
+
+    if from_retry:
+        module.retry_queue = module.retry_queue[len(batch) :]
+    else:
+        module.position += len(batch)
+
+    newly_found: list[int] = []
+    for did, ex in replies:
         if ex.status == "OK":
             module.discovered.add(did)
             module.conditional.discard(did)

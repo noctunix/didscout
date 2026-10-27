@@ -757,6 +757,53 @@ def test_sweep_obduds_ecus_enforces_max_dids_times_responder_count(
     assert "222A01" not in sent
 
 
+def test_sweep_detects_sleeping_ecu_and_exits_3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if cmd == "222A00":
+            return hex_reply("77A", bytes([0x62, 0x2A, 0x00, 0xAA]))
+        # 2A01-2A03 all come back NRC 11 - 3 of the 4 swept DIDs.
+        return hex_reply("77A", bytes([0x7F, 0x22, 0x11]))
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    result = asyncio.run(
+        cx.sweep("fake", "710", None, "2A00", "2A03", "vehicle", tmp_path, False, None)
+    )
+    assert result == 3
+    assert "stopped answering" in capsys.readouterr().err
+
+
+def test_sweep_does_not_flag_a_healthy_run_even_with_some_nrc11(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if cmd == "222A00":
+            return hex_reply("77A", bytes([0x7F, 0x22, 0x11]))
+        return hex_reply("77A", bytes([0x62, 0x2A, 0x01, 0xAA]))
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    result = asyncio.run(
+        cx.sweep("fake", "710", None, "2A00", "2A03", "vehicle", tmp_path, False, None)
+    )
+    assert result == 0
+    assert "stopped answering" not in capsys.readouterr().err
+
+
 def test_identify_reads_only_four_dids_and_decodes_system_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2667,6 +2714,114 @@ def test_discovery_batch_writes_summary_and_only_interesting_entries(
 
     individual = [e for e in discover_entries if e["status"] != "SUMMARY"]
     assert {e["command"] for e in individual} == {"221000", "221003"}
+
+
+def test_batch_is_asleep_at_least_half_nrc11() -> None:
+    assert cx._batch_is_asleep({}, 0) is False
+    assert cx._batch_is_asleep({"OK": 1, "NRC 11 serviceNotSupported": 1}, 2) is True
+    assert cx._batch_is_asleep({"OK": 2, "NRC 11 serviceNotSupported": 1}, 3) is False
+    assert cx._batch_is_asleep({"NRC 11 serviceNotSupported": 1}, 1) is True
+
+
+def test_discovery_batch_detects_sleeping_ecu_and_does_not_advance_progress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_DISCOVERY_BATCH", 4)
+    monkeypatch.setattr(cx, "RECORD_ASLEEP_PAUSE_SECONDS", 60.0)
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if cmd == "221000":
+            return hex_reply("77A", bytes([0x62, 0x10, 0x00, 0xAA]))
+        # The rest come back NRC 11 serviceNotSupported - 3 of 4 replies, so
+        # the batch as a whole counts as asleep.
+        return hex_reply("77A", bytes([0x7F, 0x22, 0x11]))
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    module = cx.RecordModule(
+        key="mod",
+        protocol="6",
+        setup=[],
+        validator=cx.check_sweep_allowed,
+        responder="77A",
+        discover_ranges=[],
+    )
+    module.order = [0x1000, 0x1001, 0x1002, 0x1003]
+
+    state = cx.RunState.new("vehicle", "fake")
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> list[int]:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            return await cx.run_discovery_batch(link, module, state, state_path)
+
+    before = time.monotonic()
+    newly_found = asyncio.run(scenario())
+    assert newly_found == []
+    assert module.position == 0  # progress did not advance
+    assert module.discovered == set()
+    assert module.discovery_paused_until >= before + cx.RECORD_ASLEEP_PAUSE_SECONDS
+
+    entries = [json.loads(line) for line in (tmp_path / "capture.jsonl").read_text().splitlines()]
+    discover_entries = [e for e in entries if e["stage"] == "discover-mod"]
+    assert len(discover_entries) == 1
+    assert discover_entries[0]["status"] == "ASLEEP"
+    assert discover_entries[0]["command"] == "BATCH 1000-1003"
+
+    # state.json was not touched - the batch's position/discovered/conditional
+    # never changed.
+    position, discovered, conditional = state.discovery_state("mod")
+    assert (position, discovered, conditional) == (0, [], [])
+
+
+def test_discovery_batch_asleep_also_leaves_retry_queue_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "RECORD_DISCOVERY_BATCH", 4)
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        return hex_reply("77A", bytes([0x7F, 0x22, 0x11]))
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    module = cx.RecordModule(
+        key="mod",
+        protocol="6",
+        setup=[],
+        validator=cx.check_sweep_allowed,
+        responder=None,
+        discover_ranges=[],
+    )
+    module.order = [0x1000, 0x1001]
+    module.retry_queue = [0x2000, 0x2001]
+
+    state = cx.RunState.new("vehicle", "fake")
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> list[int]:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            return await cx.run_discovery_batch(link, module, state, state_path)
+
+    newly_found = asyncio.run(scenario())
+    assert newly_found == []
+    assert module.retry_queue == [0x2000, 0x2001]  # retry queue is untouched, not drained
+    assert module.position == 0
 
 
 def test_mode01_protocol_is_whichever_answered_mode01_not_the_profile(

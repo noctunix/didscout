@@ -3415,6 +3415,10 @@ class DerivedData:
     modules: dict[tuple[str | None, str | None], ModuleRecord]
     speed_series: list[tuple[float, int]]
     notes: list[NoteSample] = field(default_factory=list)
+    # Raw NOTE/EVENT/GAP entries, kept verbatim for the report only - never
+    # consulted by any classification logic, which works off `notes`/the DID
+    # records instead. (t, kind, text).
+    log: list[tuple[float, str, str]] = field(default_factory=list)
 
 
 def _entry_seconds(entry: dict[str, object], origin: datetime | None) -> float:
@@ -3476,6 +3480,7 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
     modules: dict[tuple[str | None, str | None], ModuleRecord] = {}
     speed_series: list[tuple[float, int]] = []
     notes: list[NoteSample] = []
+    log: list[tuple[float, str, str]] = []
     origin: datetime | None = None
     current_request: str | None = None
     current_response: str | None = None
@@ -3515,6 +3520,21 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
                 current_phase = marker
             for note_key, note_value in parse_note(response_raw):
                 notes.append(NoteSample(t, note_key, note_value))
+            log.append((t, "note", response_raw))
+            continue
+        if command == "EVENT":
+            log.append((t, "event", response_raw))
+            continue
+        if command == "GAP":
+            log.append((t, "gap", response_raw))
+            continue
+        if command == "READING":
+            # Built by `import_app_recording` with the canonical key already
+            # resolved - unlike a typed NOTE, never run back through
+            # `parse_note`'s fuzzy text matching.
+            reading_key, _, reading_value = response_raw.partition(" ")
+            with contextlib.suppress(ValueError):
+                notes.append(NoteSample(t, reading_key, float(reading_value)))
             continue
 
         has_module = entry.get("module") is not None
@@ -3557,7 +3577,7 @@ def analyze_capture(entries: list[dict[str, object]]) -> DerivedData:
         if payload:
             record.samples.append(DidSample(t, payload, current_phase))
 
-    return DerivedData(modules, speed_series, notes)
+    return DerivedData(modules, speed_series, notes, log)
 
 
 def _most_common_length(payloads: list[bytes]) -> int:
@@ -4029,6 +4049,16 @@ def _render_note_matches(matches: dict[str, list[NoteMatch]], notes: list[NoteSa
     return lines
 
 
+def _render_log(log: list[tuple[float, str, str]]) -> list[str]:
+    if not log:
+        return []
+    lines = ["## Notes, events & gaps", ""]
+    for t, kind, text in log:
+        lines.append(f"- t={t:.1f}s [{kind}] {text}")
+    lines.append("")
+    return lines
+
+
 def render_derive_report(
     data: DerivedData, vehicle: str, source: Path, matches: dict[str, list[NoteMatch]]
 ) -> str:
@@ -4053,6 +4083,7 @@ def render_derive_report(
         f"Generated: {datetime.now(UTC).isoformat()}",
         "",
         *_render_note_matches(matches, data.notes),
+        *_render_log(data.log),
         "## Candidates",
         "",
         "### Speed-correlated fields",
@@ -4117,6 +4148,341 @@ def render_derive_report(
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# App recordings: import an Android app recording (an obdbridge buffer plus
+# its marker sidecar) into the same capture-entry shape `analyze_capture`
+# works on, so `derive`/`share` handle either source through one pipeline.
+# ---------------------------------------------------------------------------
+
+# The app's one fixed recording plan (didscout-app's RecordingController) -
+# a signal id's prefix up to the first underscore names its module, which
+# this maps to the CAN request/response headers `analyze_capture` groups
+# DIDs by; the buffer itself only ever carries the plan's id/version, never
+# its modules, so this mapping has to be hardcoded against the one plan the
+# app actually ships.
+APP_PLAN_MODULE_HEADERS: dict[str, tuple[str, str]] = {
+    "module7": ("18DA04F1", "18DAF104"),
+    "module6": ("710", "77A"),
+}
+
+# ObdTransportStatusMessage's Dart enum spelling (see CxBufferWriter.kt) to
+# the capture-entry status vocabulary `analyze_capture`/`share` already
+# understand. Every non-OK outcome becomes TRANSPORT_ERROR except an actual
+# timeout - both are in NO_RESPONSE_STATUSES, so `share` drops their response
+# text the same way it already does for a real capture's transport failures.
+APP_TRANSPORT_STATUS: dict[str, str] = {
+    "ok": "OK",
+    "timeout": "TIMEOUT",
+    "overflow": "TRANSPORT_ERROR",
+    "disconnected": "TRANSPORT_ERROR",
+    "rejectedByGuard": "TRANSPORT_ERROR",
+    "writeFailed": "TRANSPORT_ERROR",
+    "cancelled": "TRANSPORT_ERROR",
+}
+
+# The marker sidecar's `phase` values to MARKER_PATTERNS' canonical ones -
+# "stand" (vehicle standing, not necessarily charging) is didscout's "idle".
+APP_MARKER_PHASES: dict[str, str] = {
+    "drive": "drive",
+    "charge": "charge",
+    "stand": "idle",
+    "park": "park",
+}
+
+# The marker sidecar's `reading` quantities, validated against rather than
+# just trusted - a quantity a future sidecar version adds should fail loudly
+# here instead of silently being treated as some unrelated note key.
+APP_READING_QUANTITIES = frozenset(
+    {"soc", "battery_temp", "outside_temp", "range", "charge_power", "odometer"}
+)
+
+
+def is_app_recording(path: Path) -> bool:
+    """True if `path` is an Android app recording buffer rather than a
+    `record` run's capture.jsonl - distinguished by the buffer's own header
+    line (`format`/`sessionId`/`planId`), which no capture.jsonl entry ever
+    has."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for raw_line in handle:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    return False
+                return (
+                    isinstance(obj, dict)
+                    and isinstance(obj.get("format"), str)
+                    and isinstance(obj.get("sessionId"), str)
+                    and isinstance(obj.get("planId"), str)
+                )
+    except OSError:
+        return False
+    return False
+
+
+def _app_epoch_iso(epoch_ms: float) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000.0, tz=UTC).isoformat()
+
+
+def _app_parse_signal_id(signal_id: str) -> tuple[str, str] | None:
+    """`"module7_22f40d"` -> `("module7", "22F40D")`, or None if `signal_id`
+    doesn't name a module this importer knows (APP_PLAN_MODULE_HEADERS) - a
+    signal from a future plan version is skipped with a warning rather than
+    guessed at."""
+    module_id, _, command = signal_id.partition("_")
+    if not command or module_id not in APP_PLAN_MODULE_HEADERS:
+        return None
+    return module_id, command.upper()
+
+
+def _app_capture_entry(
+    epoch_ms: float,
+    command: str,
+    status: str,
+    response: str,
+    *,
+    module: str | None = None,
+    stage: str = "watch",
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "stage": stage,
+        "command": command,
+        "status": status,
+        "response": response,
+        "started_utc": _app_epoch_iso(epoch_ms),
+    }
+    if module is not None:
+        entry["module"] = module
+    return entry
+
+
+def _app_buffer_lines(buffer_path: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """The buffer's header object and its body lines, in file order - already
+    chronological, since the writer only ever appends. A line that fails to
+    parse as a JSON object is skipped with a warning rather than raising: the
+    one a process kill can leave behind is the buffer's own last line, and
+    tolerating it here is what lets a recording survive that."""
+    header: dict[str, object] | None = None
+    body: list[dict[str, object]] = []
+    for lineno, raw_line in enumerate(
+        buffer_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not raw_line.strip():
+            continue
+        try:
+            obj = json.loads(raw_line)
+        except json.JSONDecodeError:
+            print(
+                f"[didscout] {buffer_path}: line {lineno}: malformed JSON, skipped",
+                file=sys.stderr,
+            )
+            continue
+        if not isinstance(obj, dict):
+            print(
+                f"[didscout] {buffer_path}: line {lineno}: not an object, skipped",
+                file=sys.stderr,
+            )
+            continue
+        if header is None:
+            header = obj
+        else:
+            body.append(obj)
+    return header or {}, body
+
+
+def _app_marker_lines(sidecar_path: Path) -> list[dict[str, object]]:
+    if not sidecar_path.exists():
+        return []
+    markers: list[dict[str, object]] = []
+    for lineno, raw_line in enumerate(
+        sidecar_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not raw_line.strip():
+            continue
+        try:
+            obj = json.loads(raw_line)
+        except json.JSONDecodeError:
+            print(
+                f"[didscout] {sidecar_path}: line {lineno}: malformed JSON, skipped",
+                file=sys.stderr,
+            )
+            continue
+        if not isinstance(obj, dict):
+            print(
+                f"[didscout] {sidecar_path}: line {lineno}: not an object, skipped",
+                file=sys.stderr,
+            )
+            continue
+        markers.append(obj)
+    return markers
+
+
+def _app_exchange_entries(
+    module_id: str, command: str, line: dict[str, object], current_module: str | None
+) -> list[dict[str, object]]:
+    """One recognised exchange line's capture entries: a module header switch
+    (if `current_module` differs) followed by the command/response entry
+    itself - mirroring how `record` re-sends a module's setup whenever it
+    addresses a different one than the last read."""
+    request_header, response_header = APP_PLAN_MODULE_HEADERS[module_id]
+    epoch_ms = float(line["requestStartedUtcMs"])  # type: ignore[arg-type]
+    transport = str(line.get("transport", ""))
+    status = APP_TRANSPORT_STATUS.get(transport, "TRANSPORT_ERROR")
+    response = ""
+    if status == "OK":
+        raw_hex = line.get("raw")
+        try:
+            response = bytes.fromhex(str(raw_hex or "")).decode("ascii", errors="replace")
+        except ValueError:
+            status = "TRANSPORT_ERROR"
+
+    entries: list[dict[str, object]] = []
+    if module_id != current_module:
+        entries.append(
+            _app_capture_entry(
+                epoch_ms, f"ATSH{request_header}", "OK", "OK", stage="app-setup"
+            )
+        )
+        entries.append(
+            _app_capture_entry(
+                epoch_ms, f"ATCRA{response_header}", "OK", "OK", stage="app-setup"
+            )
+        )
+    entries.append(_app_capture_entry(epoch_ms, command, status, response, module=module_id))
+    return entries
+
+
+def _app_marker_entries(
+    marker: dict[str, object], sidecar_path: Path
+) -> tuple[float, list[dict[str, object]]] | None:
+    """One marker sidecar line's (epoch_ms, capture entries), or None if it is
+    malformed or of an unknown type - warned about by the caller's caller
+    through this function's own stderr warnings."""
+    kind = marker.get("type")
+
+    def warn(what: str) -> None:
+        print(f"[didscout] {sidecar_path}: {what}, skipped: {marker!r}", file=sys.stderr)
+
+    if kind == "phase":
+        at, phase = marker.get("at"), marker.get("phase")
+        canonical = APP_MARKER_PHASES.get(phase) if isinstance(phase, str) else None
+        if not isinstance(at, str) or canonical is None:
+            warn("malformed phase marker")
+            return None
+        epoch_ms = datetime.fromisoformat(at).timestamp() * 1000.0
+        entry = _app_capture_entry(epoch_ms, "PHASE", canonical.upper(), canonical, stage="phase")
+        return epoch_ms, [entry]
+
+    if kind == "note":
+        at, text = marker.get("at"), marker.get("text")
+        if not isinstance(at, str) or not isinstance(text, str):
+            warn("malformed note marker")
+            return None
+        epoch_ms = datetime.fromisoformat(at).timestamp() * 1000.0
+        return epoch_ms, [_app_capture_entry(epoch_ms, "NOTE", "NOTE", text, stage="display")]
+
+    if kind == "event":
+        at, label = marker.get("at"), marker.get("label")
+        if not isinstance(at, str) or not isinstance(label, str):
+            warn("malformed event marker")
+            return None
+        epoch_ms = datetime.fromisoformat(at).timestamp() * 1000.0
+        return epoch_ms, [_app_capture_entry(epoch_ms, "EVENT", "EVENT", label, stage="display")]
+
+    if kind == "reading":
+        read_at, quantity, value = (
+            marker.get("read_at"),
+            marker.get("quantity"),
+            marker.get("value"),
+        )
+        if (
+            not isinstance(read_at, str)
+            or not isinstance(quantity, str)
+            or quantity not in APP_READING_QUANTITIES
+            or not isinstance(value, int | float)
+        ):
+            warn("malformed reading marker")
+            return None
+        epoch_ms = datetime.fromisoformat(read_at).timestamp() * 1000.0
+        text = f"{quantity} {value}"
+        return epoch_ms, [_app_capture_entry(epoch_ms, "READING", "READING", text, stage="reading")]
+
+    warn("unknown marker type")
+    return None
+
+
+def import_app_recording(buffer_path: Path) -> list[dict[str, object]]:
+    """Converts an Android app recording (the obdbridge buffer at
+    `buffer_path`, plus its `<buffer>.markers.jsonl` sidecar if present) into
+    the same capture-entry shape `analyze_capture` already works on, so
+    `derive`/`share` handle it through the exact same pipeline as a `record`
+    run's capture.jsonl from here on. Malformed lines are skipped with a
+    stderr warning rather than raising - a torn tail from a killed app
+    process must not sink an otherwise-good recording."""
+    header, body = _app_buffer_lines(buffer_path)
+    sidecar_path = buffer_path.parent / f"{buffer_path.name}.markers.jsonl"
+    markers = _app_marker_lines(sidecar_path)
+
+    timed: list[tuple[float, int, list[dict[str, object]]]] = []
+    order = 0
+    current_module: str | None = None
+    created_utc_ms = header.get("createdUtcMs")
+    last_epoch_ms = float(created_utc_ms) if isinstance(created_utc_ms, int | float) else 0.0
+
+    for lineno, line in enumerate(body, start=1):
+        if "gap" in line:
+            reason = str(line.get("reason", ""))
+            entry = _app_capture_entry(last_epoch_ms, "GAP", "GAP", reason, stage="gap")
+            timed.append((last_epoch_ms, order, [entry]))
+            order += 1
+            continue
+        signal_id = line.get("signalId")
+        requested_ms = line.get("requestStartedUtcMs")
+        if "sequence" not in line or not isinstance(signal_id, str):
+            print(
+                f"[didscout] {buffer_path}: line {lineno}: not an exchange or gap, skipped",
+                file=sys.stderr,
+            )
+            continue
+        if not isinstance(requested_ms, int | float):
+            print(
+                f"[didscout] {buffer_path}: line {lineno}: missing request time, skipped",
+                file=sys.stderr,
+            )
+            continue
+        parsed = _app_parse_signal_id(signal_id)
+        if parsed is None:
+            print(
+                f"[didscout] {buffer_path}: line {lineno}: unknown signal id {signal_id!r}, "
+                "skipped",
+                file=sys.stderr,
+            )
+            continue
+        module_id, command = parsed
+        entries = _app_exchange_entries(module_id, command, line, current_module)
+        current_module = module_id
+        last_epoch_ms = float(requested_ms)
+        timed.append((last_epoch_ms, order, entries))
+        order += 1
+
+    for marker in markers:
+        result = _app_marker_entries(marker, sidecar_path)
+        if result is None:
+            continue
+        epoch_ms, entries = result
+        timed.append((epoch_ms, order, entries))
+        order += 1
+
+    timed.sort(key=lambda item: (item[0], item[1]))
+    capture_entries: list[dict[str, object]] = []
+    for _epoch_ms, _order, entries in timed:
+        capture_entries.extend(entries)
+    return capture_entries
+
+
 def resolve_capture_path(run_dir_or_file: Path) -> Path:
     path = Path(run_dir_or_file)
     return path / "capture.jsonl" if path.is_dir() else path
@@ -4130,6 +4496,16 @@ def read_capture_entries(capture_path: Path) -> list[dict[str, object]]:
     return entries
 
 
+def read_entries(capture_path: Path) -> list[dict[str, object]]:
+    """Capture entries for `derive`/`share`, from either a `record` run's
+    capture.jsonl or an Android app recording buffer - the input kind is
+    detected automatically (`is_app_recording`) from `capture_path` alone, so
+    neither caller has to know or care which one it got."""
+    if is_app_recording(capture_path):
+        return import_app_recording(capture_path)
+    return read_capture_entries(capture_path)
+
+
 def derive(
     run_dir_or_file: Path,
     *,
@@ -4138,14 +4514,15 @@ def derive(
     out: Path | None = None,
 ) -> tuple[Path | None, Path]:
     """Writes `<id>.toml` (a profile draft, `profile-draft.toml` by default)
-    and `report.md` from one `record` run's capture log. Returns
-    `(profile_path, report_path)` - `profile_path` is None if nothing
-    manufacturer-specific was found by discovery, since an empty profile would
-    never pass `load_profile` anyway. The written draft is always loaded back
-    through `load_profile` before returning, so a broken draft fails loudly
-    here rather than silently reaching a PR."""
+    and `report.md` from one `record` run's capture log, or from an Android
+    app recording buffer (see `read_entries`). Returns `(profile_path,
+    report_path)` - `profile_path` is None if nothing manufacturer-specific
+    was found by discovery, since an empty profile would never pass
+    `load_profile` anyway. The written draft is always loaded back through
+    `load_profile` before returning, so a broken draft fails loudly here
+    rather than silently reaching a PR."""
     capture_path = resolve_capture_path(run_dir_or_file)
-    entries = read_capture_entries(capture_path)
+    entries = read_entries(capture_path)
     data = analyze_capture(entries)
     note_matches = match_notes(data)
     drafts = build_draft_modules(data.modules, named_candidates(note_matches))
@@ -4195,7 +4572,9 @@ def _redact_entry(entry: dict[str, object], origin: datetime | None) -> dict[str
     stage = str(entry.get("stage", ""))
     if stage == "connection" or command in ADAPTER_IDENTITY_COMMANDS:
         return None
-    if command == "NOTE":
+    if command in ("NOTE", "EVENT"):
+        # An app recording's EVENT marker is free text the same way a typed
+        # NOTE is - dropped unless it canonicalizes to a phase marker.
         marker = classify_note_marker(str(entry.get("response", "")))
         if marker is None:
             return None
@@ -4220,9 +4599,11 @@ def _redact_entry(entry: dict[str, object], origin: datetime | None) -> dict[str
 
 def share(run_dir_or_file: Path, *, vehicle: str | None = None, out: Path | None = None) -> Path:
     """Writes a redacted `<name>.share.jsonl.gz`, safe to attach to a PR under
-    `captures/` - see `validate_share` for the rules it enforces."""
+    `captures/`, from either a `record` run's capture.jsonl or an Android app
+    recording buffer (see `read_entries`) - see `validate_share` for the
+    rules it enforces."""
     capture_path = resolve_capture_path(run_dir_or_file)
-    entries = read_capture_entries(capture_path)
+    entries = read_entries(capture_path)
     origin: datetime | None = None
     for entry in entries:
         ts = entry.get("started_utc")
@@ -4739,7 +5120,11 @@ def main(argv: list[str]) -> int:
         "derive",
         help="write a profile draft + report.md from one `record` run's capture log",
     )
-    d.add_argument("run", type=Path, help="a `record` run directory, or its capture.jsonl")
+    d.add_argument(
+        "run",
+        type=Path,
+        help="a `record` run directory, its capture.jsonl, or an app recording buffer",
+    )
     d.add_argument("--id", help="profile id for the draft (default: profile-draft)")
     d.add_argument("--vehicle", help="vehicle name for the draft/report (default: unknown vehicle)")
     d.add_argument("--out", type=Path, help="output directory (default: the run directory)")
@@ -4747,7 +5132,11 @@ def main(argv: list[str]) -> int:
         "share",
         help="write a redacted <name>.share.jsonl.gz, safe to attach to a captures/ PR",
     )
-    sh.add_argument("run", type=Path, help="a `record` run directory, or its capture.jsonl")
+    sh.add_argument(
+        "run",
+        type=Path,
+        help="a `record` run directory, its capture.jsonl, or an app recording buffer",
+    )
     sh.add_argument(
         "--vehicle", help="vehicle name for the share header (default: unknown vehicle)"
     )

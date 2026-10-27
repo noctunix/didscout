@@ -2651,6 +2651,161 @@ def test_rediscovery_every_15_min_stationary_skips_known_ecus(
     asyncio.run(scenario())
 
 
+def test_last_rediscover_time_roundtrip() -> None:
+    state = cx.RunState.new("vehicle", "fake")
+    assert state.last_rediscover_time() is None
+    state.set_last_rediscover_time(12345.0)
+    assert state.last_rediscover_time() == 12345.0
+
+
+def test_build_record_loop_state_skips_initial_phase_rediscover_when_recent() -> None:
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": [], "chosen": None})
+    recent = time.time() - 120.0  # well within the 15 min cooldown
+    state.set_last_rediscover_time(recent)
+
+    loop_state = cx.build_record_loop_state(None, state)
+    assert loop_state.skip_initial_phase_rediscover is True
+    assert abs((time.monotonic() - loop_state.last_rediscover) - 120.0) < 5.0
+
+
+def test_build_record_loop_state_does_not_skip_when_cooldown_elapsed() -> None:
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": [], "chosen": None})
+    old = time.time() - cx.RECORD_REDISCOVER_INTERVAL - 60.0
+    state.set_last_rediscover_time(old)
+
+    loop_state = cx.build_record_loop_state(None, state)
+    assert loop_state.skip_initial_phase_rediscover is False
+
+
+def test_build_record_loop_state_does_not_skip_without_persisted_timestamp() -> None:
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": [], "chosen": None})
+
+    loop_state = cx.build_record_loop_state(None, state)
+    assert loop_state.skip_initial_phase_rediscover is False
+
+
+def test_record_maybe_rediscover_skips_initial_phase_trigger_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"n": 0}
+
+    async def fake_rediscover(
+        _link: cx.AdapterLink,
+        _state: cx.RunState,
+        _state_path: Path,
+        loop_state: cx.RecordLoopState,
+    ) -> None:
+        calls["n"] += 1
+        loop_state.last_rediscover = time.monotonic()
+
+    monkeypatch.setattr(cx, "_record_rediscover", fake_rediscover)
+
+    loop_state = cx.RecordLoopState(
+        modules={},
+        speed_key=None,
+        by_key={},
+        next_due={},
+        phase="stationary",
+        skip_initial_phase_rediscover=True,
+    )
+
+    async def scenario() -> None:
+        # entered_stationary (changed=True) is skipped exactly once.
+        await cx._record_maybe_rediscover(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            loop_state,
+            True,
+        )
+        assert calls["n"] == 0
+        assert loop_state.skip_initial_phase_rediscover is False
+
+        # A later phase change in the same run is no longer skipped.
+        await cx._record_maybe_rediscover(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            loop_state,
+            True,
+        )
+        assert calls["n"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_rediscovery_skipped_on_resume_within_cooldown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cx, "ECU11_REQUEST_IDS", [0x710, 0x720])
+    monkeypatch.setattr(cx, "ECU29_IDS", [])
+    monkeypatch.setattr(cx, "VAG29_IDS", [])
+
+    current_header: dict[str, str] = {"value": ""}
+    kmh = {"value": 0}
+
+    def hex_reply(header: str, message: bytes) -> bytes:
+        data = bytes([len(message)]) + message
+        return (header + data.hex().upper()).encode() + b"\r>"
+
+    def responder(cmd: str) -> bytes:
+        if cmd.startswith("ATSH"):
+            current_header["value"] = cmd[4:]
+            return b"OK\r>"
+        if cmd == "010D":
+            return hex_reply("7E8", bytes([0x41, 0x0D, kmh["value"]]))
+        if cmd.startswith("AT"):
+            return b"OK\r>"
+        if (
+            current_header["value"] == "720"
+            and cmd.startswith("22")
+            and cmd[2:] in cx.IDENTIFY_DIDS
+        ):
+            return hex_reply("721", bytes([0x62, int(cmd[2:4], 16), int(cmd[4:6], 16), 0x01]))
+        return b"NO DATA\r>"
+
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(responder))
+
+    state = cx.RunState.new("vehicle", "fake")
+    state.set_result("protocol", {"answered": ["6"], "chosen": "6"})
+    state.set_result("mode01", {"supported_pids": ["0D"], "protocol": "6"})
+    state.set_result("ecus11", {})
+    state.set_result("ecus29", {})
+    state.set_result("obduds", {})
+    # A rediscovery already ran 2 minutes ago - well within the 15 min
+    # cooldown - so the first stationary phase change on this fresh connect
+    # must not trigger another one.
+    state.set_last_rediscover_time(time.time() - 120.0)
+    state_path = tmp_path / "state.json"
+    state.save(state_path)
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, tmp_path / "capture.jsonl", "vehicle") as link:
+            assert link is not None
+            loop_state = cx.build_record_loop_state(None, state)
+            assert loop_state.skip_initial_phase_rediscover is True
+
+            await cx.record_loop_tick(link, state, state_path, loop_state)
+            assert loop_state.phase == "stationary"
+            assert "ecus11:720" not in loop_state.modules  # skipped, not resumed
+            assert loop_state.skip_initial_phase_rediscover is False
+
+            # A later phase change (moving -> stationary again) is not skipped.
+            speed_key = ("mode01", "010D")
+            kmh["value"] = 30
+            loop_state.next_due[speed_key] = time.monotonic()
+            await cx.record_loop_tick(link, state, state_path, loop_state)  # -> moving
+            kmh["value"] = 0
+            loop_state.next_due[speed_key] = time.monotonic()
+            await cx.record_loop_tick(link, state, state_path, loop_state)  # -> stationary
+            assert "ecus11:720" in loop_state.modules
+
+    asyncio.run(scenario())
+
+
 def test_discovery_batch_writes_summary_and_only_interesting_entries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -1811,6 +1811,18 @@ class RunState:
             "conditional": sorted(conditional),
         }
 
+    def last_rediscover_time(self) -> float | None:
+        """Wall-clock `time.time()` of the last ECU rediscovery scan
+        (_record_rediscover), persisted across restarts - None if this run
+        has never rediscovered yet."""
+        value = self.data.get("last_rediscover_epoch")
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        return float(value)
+
+    def set_last_rediscover_time(self, epoch: float) -> None:
+        self.data["last_rediscover_epoch"] = epoch
+
 
 RECORD_RUN_DIR_PATTERN = re.compile(r"record_(\d{8}_\d{6})_(.+)")
 
@@ -2729,6 +2741,12 @@ class RecordLoopState:
     watch_last_logged: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     watch_last_log_time: dict[tuple[str, str], float] = field(default_factory=dict)
     last_rediscover: float = field(default_factory=time.monotonic)
+    # True for exactly one `_record_maybe_rediscover` call after a fresh
+    # connect/resume whose persisted last-rediscovery timestamp was less than
+    # RECORD_REDISCOVER_INTERVAL ago - suppresses that one phase-change
+    # rediscovery (periodic due_for_interval rediscovery still applies), then
+    # clears itself. See build_record_loop_state.
+    skip_initial_phase_rediscover: bool = False
     # Successful module-switch setup commands (see `_record_ensure_module`) -
     # no longer logged individually, counted here for `record_status_line`.
     setup_commands_sent: int = 0
@@ -2754,6 +2772,21 @@ def build_record_loop_state(
     next_due = {key: time.monotonic() for key in by_key}
     watch_interval = {key: entry.base_interval for key, entry in by_key.items()}
     discovery_done_initial = sum(m.position for m in modules.values() if m.discoverable)
+
+    # Seed the rediscovery cooldown from state.json, if a previous run (or an
+    # earlier connection within this one) already rediscovered recently - a
+    # fresh connect/resume should not immediately rediscover again just
+    # because the vehicle happens to be stationary at startup.
+    now = time.monotonic()
+    last_rediscover = now
+    skip_initial_phase_rediscover = False
+    persisted = state.last_rediscover_time()
+    if persisted is not None:
+        elapsed = max(0.0, time.time() - persisted)
+        if elapsed < RECORD_REDISCOVER_INTERVAL:
+            last_rediscover = now - elapsed
+            skip_initial_phase_rediscover = True
+
     return RecordLoopState(
         modules=modules,
         speed_key=speed_key,
@@ -2763,6 +2796,8 @@ def build_record_loop_state(
         watch_interval=watch_interval,
         discovery_done_initial=discovery_done_initial,
         discover_while_moving=discover_while_moving,
+        last_rediscover=last_rediscover,
+        skip_initial_phase_rediscover=skip_initial_phase_rediscover,
     )
 
 
@@ -2992,6 +3027,7 @@ async def _record_rediscover(
                         key, f"17FC00{ecu}", response, "7", check_vag29_allowed
                     )
 
+    state.set_last_rediscover_time(time.time())
     state.save(state_path)
     # The scans above left the adapter's actual header/protocol in whatever
     # state the last probe set it to - unknown to the scheduler, same as a
@@ -3011,6 +3047,13 @@ async def _record_maybe_rediscover(
     # Probing hundreds of unknown diagnostic ids is discovery traffic, so like
     # DID discovery it never runs while the vehicle is moving.
     entered_stationary = changed and loop_state.phase == "stationary"
+    if entered_stationary and loop_state.skip_initial_phase_rediscover:
+        # Consumed once: a fresh connect/resume whose persisted last
+        # rediscovery was less than RECORD_REDISCOVER_INTERVAL ago skips this
+        # one phase-change trigger; due_for_interval still applies normally
+        # afterwards, and any later phase change in this run is unaffected.
+        loop_state.skip_initial_phase_rediscover = False
+        entered_stationary = False
     if entered_stationary or due_for_interval:
         await _record_rediscover(link, state, state_path, loop_state)
 

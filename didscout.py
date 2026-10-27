@@ -1235,6 +1235,16 @@ async def connect_adapter(
     from bleak import BleakClient
 
     async with BleakClient(address, timeout=20.0) as client:
+        # BlueZ needs an explicit MTU exchange before client.mtu_size reflects
+        # anything but the ATT default (23) - other backends don't have this
+        # method at all, hence the getattr guard, and a failure here just
+        # means falling back to that default, not a reason to abort.
+        acquire_mtu = getattr(client, "_acquire_mtu", None)
+        if acquire_mtu is not None:
+            try:
+                await acquire_mtu()
+            except Exception as error:
+                print(f"MTU acquisition failed, using default: {error}", file=sys.stderr)
         chunk = max(20, client.mtu_size - 3)
         write_char = client.services.get_characteristic(UART_WRITE)
         if write_char is None:
@@ -3969,6 +3979,23 @@ def render_profile_draft_toml(*, profile_id: str, vehicle: str, drafts: list[Dra
     return "\n".join(lines) + "\n"
 
 
+def _collapse_identical_candidates(top: list[NoteMatch]) -> list[tuple[NoteMatch, int]]:
+    """Collapses candidates that give the same DID's r/RMSE for more than one
+    field - several byte widths at the same offset often decode to the same
+    value when the wider field's extra byte is always zero - keeping the
+    narrowest field and counting the rest as aliases. `top` is already
+    sorted by (-|r|, RMSE), so equal-key candidates are always adjacent."""
+    groups: dict[tuple[str, str, bool, float, float], list[NoteMatch]] = {}
+    order: list[tuple[str, str, bool, float, float]] = []
+    for m in top:
+        gkey = (m.label, m.did, m.derivative, m.r, m.rmse)
+        if gkey not in groups:
+            groups[gkey] = []
+            order.append(gkey)
+        groups[gkey].append(m)
+    return [(min(groups[gkey], key=lambda c: c.width), len(groups[gkey]) - 1) for gkey in order]
+
+
 def _render_note_matches(matches: dict[str, list[NoteMatch]], notes: list[NoteSample]) -> list[str]:
     counts: dict[str, int] = {}
     for note in notes:
@@ -3984,16 +4011,19 @@ def _render_note_matches(matches: dict[str, list[NoteMatch]], notes: list[NoteSa
         if not top:
             lines += ["- no candidate field found", ""]
             continue
-        for m in top:
+        for m, alias_count in _collapse_identical_candidates(top):
             signedness = "signed" if m.signed else "unsigned"
             named = not m.derivative and abs(m.r) >= NOTE_NAME_MIN_R and m.n >= NOTE_NAME_MIN_NOTES
             suffix = f' - named "{key} candidate" in the draft' if named else ""
             quantity = "d/dt raw" if m.derivative else "raw"
+            alias_suffix = (
+                f" ({alias_count} alias field(s) with identical r/RMSE)" if alias_count else ""
+            )
             lines.append(
                 f"- {m.label} / DID {m.did} / field (offset {m.offset}, width {m.width}, "
                 f"{signedness}): r={m.r:+.3f}, "
                 f"display ≈ {m.a:.4f}·{quantity} {'-' if m.b < 0 else '+'} {abs(m.b):.4f}, "
-                f"RMSE={m.rmse:.3f}, n={m.n}{suffix}"
+                f"RMSE={m.rmse:.3f}, n={m.n}{suffix}{alias_suffix}"
             )
         lines.append("")
     return lines
@@ -4362,6 +4392,24 @@ def _stop_sleep_inhibit(proc: subprocess.Popen[bytes] | None) -> None:
         proc.wait(timeout=5)
 
 
+def _resume_summary(run_dir: Path, state: RunState, profile: Profile | None) -> str:
+    """One line describing a resumed run: when it started, which inventory
+    stages already finished, and overall discovery progress across every
+    known module - everything a resuming `record` run can show without
+    touching the adapter."""
+    match = RECORD_RUN_DIR_PATTERN.fullmatch(run_dir.name)
+    started = match.group(1) if match else "?"
+    done_stages = [s for s in INVENTORY_STAGE_ORDER if state.stage_status(s) == "done"]
+    discoverable = [m for m in build_record_modules(profile, state).values() if m.discoverable]
+    total = sum(len(m.order) for m in discoverable)
+    done = sum(m.position for m in discoverable)
+    pct = 100.0 if total == 0 else done / total * 100
+    return (
+        f"resuming {run_dir} (started {started}, stages done: "
+        f"{', '.join(done_stages) or '-'}, discovery {pct:.0f}%)"
+    )
+
+
 async def record(
     address: str | None,
     profile: Profile | None,
@@ -4386,10 +4434,10 @@ async def record(
         run_dir.mkdir(parents=True, exist_ok=True)
         state = RunState.new(label, address)
     else:
-        print(f"[record] resuming {run_dir}")
         state = RunState.load(run_dir / "state.json")
         if address:
             state.address = address
+        print(f"[record] {_resume_summary(run_dir, state, profile)}")
 
     state_path = run_dir / "state.json"
     log_path = run_dir / "capture.jsonl"

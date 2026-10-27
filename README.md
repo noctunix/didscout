@@ -64,7 +64,23 @@ so a long stationary stretch doesn't drown the capture in repeats. Press
 Ctrl-C when you're done (e.g. back home from a drive/charge). A dropped BLE
 connection reconnects with backoff and resumes where it left off; starting
 `record` again later resumes the same unfinished run automatically (`--new`
-to start fresh instead).
+to start fresh instead), printing when that run started, which inventory
+stages already finished, and overall discovery progress.
+
+`--discover-while-moving` lifts the moving/stationary split for discovery:
+it still only ever touches profile modules that set `discover_while_moving =
+true` (see `CONTRIBUTING.md`), runs at most one discovery batch every 5 s
+while moving, and never touches an ECU whose identified system name looks
+like a steering/braking system (`ABS`/`ESC`/`ESP`/`EPS`/`Lenk`/`Steer`/
+`Airbag`/`Brems`/`Brake`/`Parksp`) - that last check is enforced in code and
+overrides whatever the profile says.
+
+If a module's discovery batch comes back with at least half its replies as
+`NRC 11 serviceNotSupported`, `record` treats the ECU as asleep: it logs one
+`ASLEEP` summary, leaves that module's progress untouched, and pauses its
+discovery for 60 s before trying again. `sweep` applies the same check across
+a whole run - if over half the replies were `NRC 11`, it prints a warning and
+exits 3 instead of reporting a near-empty hit list.
 
 On Ctrl-C, `record` automatically runs `derive` and `share` (see below) on its
 own run directory and prints the resulting paths plus a one-line hint for how

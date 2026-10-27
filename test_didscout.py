@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -1249,6 +1250,126 @@ def test_connect_adapter_yields_link_that_logs_each_exchange(
     ]
 
 
+def test_connect_adapter_calls_acquire_mtu_before_reading_mtu_size(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeCharacteristic:
+        properties = ["write-without-response"]
+
+    class FakeServices:
+        def get_characteristic(self, _uuid: str) -> FakeCharacteristic:
+            return FakeCharacteristic()
+
+    class FakeClient:
+        services = FakeServices()
+
+        def __init__(self, _address: str, *, timeout: float) -> None:
+            self.callback: Callable[[object, bytes], None] | None = None
+            self.mtu_size = 23  # BlueZ's ATT default before negotiation
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: TracebackType | None,
+        ) -> None:
+            pass
+
+        async def pair(self) -> None:
+            pass
+
+        async def _acquire_mtu(self) -> None:
+            self.mtu_size = 247  # the real, negotiated MTU
+
+        async def start_notify(self, _uuid: str, callback: Callable[[object, bytes], None]) -> None:
+            self.callback = callback
+
+        async def stop_notify(self, _uuid: str) -> None:
+            pass
+
+        async def write_gatt_char(
+            self, _characteristic: FakeCharacteristic, data: bytes, *, response: bool
+        ) -> None:
+            assert self.callback is not None
+            self.callback(None, b"OK\r>")
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    log_path = tmp_path / "link.jsonl"
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, log_path, "mystate") as link:
+            assert link is not None
+            await link.execute("ATE0", "setup")
+
+    asyncio.run(scenario())
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["mtu"] == 247
+
+
+def test_connect_adapter_ignores_acquire_mtu_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeCharacteristic:
+        properties = ["write-without-response"]
+
+    class FakeServices:
+        def get_characteristic(self, _uuid: str) -> FakeCharacteristic:
+            return FakeCharacteristic()
+
+    class FakeClient:
+        mtu_size = 23
+        services = FakeServices()
+
+        def __init__(self, _address: str, *, timeout: float) -> None:
+            self.callback: Callable[[object, bytes], None] | None = None
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: TracebackType | None,
+        ) -> None:
+            pass
+
+        async def pair(self) -> None:
+            pass
+
+        async def _acquire_mtu(self) -> None:
+            raise RuntimeError("not supported on this platform")
+
+        async def start_notify(self, _uuid: str, callback: Callable[[object, bytes], None]) -> None:
+            self.callback = callback
+
+        async def stop_notify(self, _uuid: str) -> None:
+            pass
+
+        async def write_gatt_char(
+            self, _characteristic: FakeCharacteristic, data: bytes, *, response: bool
+        ) -> None:
+            assert self.callback is not None
+            self.callback(None, b"OK\r>")
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    log_path = tmp_path / "link.jsonl"
+
+    async def scenario() -> None:
+        async with cx.connect_adapter("fake", False, log_path, "mystate") as link:
+            assert link is not None
+            await link.execute("ATE0", "setup")
+
+    asyncio.run(scenario())  # must not raise
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["mtu"] == 23
+
+
 def test_connect_adapter_yields_none_without_write_characteristic(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1747,6 +1868,33 @@ def _fake_record_client(responder: Callable[[str], bytes]) -> type:
             self.callback(None, reply)
 
     return FakeClient
+
+
+def test_resume_summary_reports_start_time_stages_and_discovery_progress(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "record_20261027_153000_vehicle"
+    run_dir.mkdir()
+    state = cx.RunState.new("vehicle", "fake")
+    state.mark_stage("adapter", "done")
+    state.mark_stage("protocol", "done")
+    state.set_result("ecus11", {"710": {"response": "77A", "identify": {}}})
+    state.save_discovery_state("ecus11:710", 50, [], [])
+
+    summary = cx._resume_summary(run_dir, state, None)
+    assert "record_20261027_153000_vehicle" in summary
+    assert "started 20261027_153000" in summary
+    assert "stages done: adapter, protocol" in summary
+    assert re.search(r"discovery \d+%", summary)
+
+
+def test_resume_summary_shows_dash_for_no_finished_stages(tmp_path: Path) -> None:
+    run_dir = tmp_path / "record_20261027_153000_vehicle"
+    run_dir.mkdir()
+    state = cx.RunState.new("vehicle", "fake")
+
+    summary = cx._resume_summary(run_dir, state, None)
+    assert "stages done: -" in summary
 
 
 def test_record_resumes_unfinished_run_and_new_flag_starts_fresh(
@@ -3470,6 +3618,34 @@ def test_match_notes_matches_charge_power_against_field_derivative() -> None:
         line for line in report_lines if "offset 0, width 2, unsigned" in line and "d/dt" in line
     )
     assert "candidate" not in deriv_line
+
+
+def test_collapse_identical_candidates_keeps_narrowest_and_counts_aliases() -> None:
+    wide = cx.NoteMatch("710/77A", "2A50", 0, 2, False, 0.99, 1.0, 0.0, 0.5, 5)
+    narrow = cx.NoteMatch("710/77A", "2A50", 1, 1, False, 0.99, 1.0, 0.0, 0.5, 5)
+    distinct = cx.NoteMatch("710/77A", "2A51", 0, 1, False, 0.80, 1.0, 0.0, 1.0, 5)
+
+    collapsed = cx._collapse_identical_candidates([wide, narrow, distinct])
+    assert collapsed == [(narrow, 1), (distinct, 0)]
+
+
+def test_collapse_identical_candidates_keeps_derivative_and_raw_separate() -> None:
+    raw = cx.NoteMatch("710/77A", "2A50", 0, 2, False, 0.99, 1.0, 0.0, 0.5, 5, derivative=False)
+    deriv = cx.NoteMatch("710/77A", "2A50", 0, 2, False, 0.99, 1.0, 0.0, 0.5, 5, derivative=True)
+
+    collapsed = cx._collapse_identical_candidates([raw, deriv])
+    assert collapsed == [(raw, 0), (deriv, 0)]
+
+
+def test_render_note_matches_mentions_alias_count() -> None:
+    wide = cx.NoteMatch("710/77A", "2A50", 0, 2, False, 0.99, 1.0, 0.0, 0.5, 5)
+    narrow = cx.NoteMatch("710/77A", "2A50", 1, 1, False, 0.99, 1.0, 0.0, 0.5, 5)
+
+    lines = cx._render_note_matches({"soc": [wide, narrow]}, [])
+    matched = [line for line in lines if line.startswith("-")]
+    assert len(matched) == 1
+    assert "offset 1, width 1" in matched[0]
+    assert "1 alias field(s)" in matched[0]
 
 
 def test_derive_notes_need_three_with_two_distinct_values(tmp_path: Path) -> None:

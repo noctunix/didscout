@@ -4162,6 +4162,7 @@ def render_derive_report(
 # app actually ships.
 APP_PLAN_MODULE_HEADERS: dict[str, tuple[str, str]] = {
     "module7": ("18DA04F1", "18DAF104"),
+    "module8": ("18DA06F1", "18DAF106"),
     "module6": ("710", "77A"),
 }
 

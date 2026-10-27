@@ -4342,14 +4342,10 @@ def _app_exchange_entries(
     entries: list[dict[str, object]] = []
     if module_id != current_module:
         entries.append(
-            _app_capture_entry(
-                epoch_ms, f"ATSH{request_header}", "OK", "OK", stage="app-setup"
-            )
+            _app_capture_entry(epoch_ms, f"ATSH{request_header}", "OK", "OK", stage="app-setup")
         )
         entries.append(
-            _app_capture_entry(
-                epoch_ms, f"ATCRA{response_header}", "OK", "OK", stage="app-setup"
-            )
+            _app_capture_entry(epoch_ms, f"ATCRA{response_header}", "OK", "OK", stage="app-setup")
         )
     entries.append(_app_capture_entry(epoch_ms, command, status, response, module=module_id))
     return entries

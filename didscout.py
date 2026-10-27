@@ -4320,6 +4320,15 @@ def validate_share(path: Path) -> None:
 
 
 RECORD_INITIAL_BACKOFF = 5.0
+# BleakError (connect/discovery/D-Bus failures) subclasses Exception directly;
+# RuntimeError/BufferError come from ElmSession losing synchronization.
+RECORD_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    TimeoutError,
+    EOFError,
+    RuntimeError,
+    BufferError,
+)
 RECORD_MAX_BACKOFF = 60.0
 
 
@@ -4453,6 +4462,9 @@ async def record(
 
     failures: dict[str, int] = {}
     pair_pending = True
+    from bleak.exc import BleakError
+
+    transport_errors: tuple[type[BaseException], ...] = (*RECORD_TRANSPORT_ERRORS, BleakError)
     backoff = RECORD_INITIAL_BACKOFF
 
     try:
@@ -4548,9 +4560,9 @@ async def record(
                         return 130
             except ProbeAbortedError as error:
                 _log_connection_event(log_path, label, "DISCONNECTED", str(error))
-            except Exception as error:
-                # Anything else here is a connection/transport failure (BLE connect
-                # timeout, OS-level disconnect, ...) - reconnect rather than crash.
+            except transport_errors as error:
+                # Only transport failures reconnect; a programming error must surface
+                # instead of hiding behind an endless reconnect loop.
                 _log_connection_event(log_path, label, "DISCONNECTED", str(error))
 
             _log_connection_event(log_path, label, "RECONNECTING")

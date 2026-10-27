@@ -202,6 +202,7 @@ poll = "once"
 
 
 def _load(tmp_path: Path, text: str, filename: str = "testprofile.toml") -> cx.Profile:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / filename
     path.write_text(text)
     return cx.load_profile(path)
@@ -380,15 +381,14 @@ def test_profile_rejects_discover_range_exceeding_max_sweep_dids(
 def test_profile_module_discover_while_moving_defaults_false_and_parses_true(
     tmp_path: Path,
 ) -> None:
-    default = _load(tmp_path, VALID_PROFILE_TOML, "default.toml")
+    default = _load(tmp_path / "default", VALID_PROFILE_TOML)
     assert default.modules[0].discover_while_moving is False
 
     opted_in = _load(
-        tmp_path,
+        tmp_path / "optedin",
         VALID_PROFILE_TOML.replace(
             'response = "77A"', 'response = "77A"\ndiscover_while_moving = true'
         ),
-        "optedin.toml",
     )
     assert opted_in.modules[0].discover_while_moving is True
 
@@ -1909,9 +1909,7 @@ def test_record_resumes_unfinished_run_and_new_flag_starts_fresh(
 
         return stage
 
-    async def fake_run_record_loop(
-        _link: object, _state: object, _profile: object, _state_path: object
-    ) -> None:
+    async def fake_run_record_loop(*_args: object) -> None:
         # The inventory is what this test cares about; the continuous loop
         # that follows it is exercised separately (see
         # test_record_loop_discovers_while_stationary_and_pauses_while_moving).
@@ -1990,9 +1988,7 @@ def test_record_reconnects_after_transport_error_and_resumes_interrupted_stage(
         },
     )
 
-    async def fake_run_record_loop(
-        _link: object, _state: object, _profile: object, _state_path: object
-    ) -> None:
+    async def fake_run_record_loop(*_args: object) -> None:
         raise asyncio.CancelledError
 
     monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
@@ -2053,9 +2049,7 @@ def test_record_marks_stage_failed_after_three_consecutive_failures(
         },
     )
 
-    async def fake_run_record_loop(
-        _link: object, _state: object, _profile: object, _state_path: object
-    ) -> None:
+    async def fake_run_record_loop(*_args: object) -> None:
         raise asyncio.CancelledError
 
     monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
@@ -4093,9 +4087,7 @@ def test_record_starts_note_reader_once_across_reconnects_and_stops_on_exit(
         },
     )
 
-    async def fake_run_record_loop(
-        _link: object, _state: object, _profile: object, _state_path: object
-    ) -> None:
+    async def fake_run_record_loop(*_args: object) -> None:
         raise asyncio.CancelledError
 
     monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
@@ -4254,9 +4246,7 @@ def test_record_no_inhibit_flag_spawns_nothing(
         },
     )
 
-    async def fake_run_record_loop(
-        _link: object, _state: object, _profile: object, _state_path: object
-    ) -> None:
+    async def fake_run_record_loop(*_args: object) -> None:
         raise asyncio.CancelledError
 
     monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
@@ -4338,9 +4328,7 @@ def test_record_terminates_inhibit_process_on_ctrl_c(
         },
     )
 
-    async def fake_run_record_loop(
-        _link: object, _state: object, _profile: object, _state_path: object
-    ) -> None:
+    async def fake_run_record_loop(*_args: object) -> None:
         raise asyncio.CancelledError
 
     monkeypatch.setattr(cx, "run_record_loop", fake_run_record_loop)
@@ -4454,3 +4442,18 @@ def test_rediscovery_never_starts_while_moving(
         )
     )
     assert bool(calls) is expected
+
+
+def test_record_surfaces_programming_errors_instead_of_reconnecting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def broken_loop(*_args: object) -> None:
+        raise TypeError("synthetic bug")
+
+    fakes = {name: (lambda *_a: asyncio.sleep(0)) for name in cx.INVENTORY_STAGE_ORDER}
+    monkeypatch.setattr(cx, "INVENTORY_STAGE_FUNCS", fakes)
+    monkeypatch.setattr(cx, "run_record_loop", broken_loop)
+    monkeypatch.setattr(bleak, "BleakClient", _fake_record_client(_ok_responder))
+
+    with pytest.raises(TypeError, match="synthetic bug"):
+        asyncio.run(asyncio.wait_for(cx.record("fake", None, "vehicle", tmp_path, True), 10))

@@ -3891,6 +3891,268 @@ def test_contributed_captures_pass_validate_share(path: Path) -> None:
     cx.validate_share(path)
 
 
+# ---------------------------------------------------------------------------
+# App recordings: an obdbridge buffer (+ marker sidecar) instead of a
+# `record` run's capture.jsonl.
+# ---------------------------------------------------------------------------
+
+
+def _iso(epoch_ms: int) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC).isoformat()
+
+
+def _app_header_line(session_id: str = "sess", created_utc_ms: int = 0) -> dict[str, object]:
+    return {
+        "format": "didscout-buffer",
+        "formatVersion": 1,
+        "sessionId": session_id,
+        "planId": "didscout-fixed-plan",
+        "planVersion": 1,
+        "timebaseId": "tb1",
+        "createdUtcMs": created_utc_ms,
+    }
+
+
+def _app_raw(header: str, message: bytes) -> str:
+    """The buffer's own lowercase-hex `raw` field for a positive single-frame
+    ISO-TP reply - the ASCII adapter reply text (see `_hex_reply`), encoded
+    as bytes the same way `CxBufferWriter.appendExchange` does."""
+    return _hex_reply(header, message).encode("ascii").hex()
+
+
+def _app_exchange_line(
+    sequence: int,
+    signal_id: str,
+    requested_ms: int,
+    *,
+    transport: str = "ok",
+    raw: str = "",
+) -> dict[str, object]:
+    return {
+        "sequence": sequence,
+        "signalId": signal_id,
+        "requestStartedUtcMs": requested_ms,
+        "receivedUtcMs": requested_ms + 50,
+        "monotonicStartNs": 0,
+        "durationNs": 50_000_000,
+        "timebaseId": "tb1",
+        "raw": raw,
+        "transport": transport,
+    }
+
+
+def _app_gap_line(after_sequence: int, reason: str, gap: int = 1) -> dict[str, object]:
+    return {"gap": gap, "afterSequence": after_sequence, "reason": reason}
+
+
+def _write_app_buffer(
+    buffer_path: Path,
+    lines: list[dict[str, object]],
+    *,
+    created_utc_ms: int = 0,
+    session_id: str = "sess",
+) -> Path:
+    header = _app_header_line(session_id=session_id, created_utc_ms=created_utc_ms)
+    buffer_path.write_text("\n".join(json.dumps(line) for line in [header, *lines]) + "\n")
+    return buffer_path
+
+
+def _write_app_markers(buffer_path: Path, markers: list[dict[str, object]]) -> Path:
+    sidecar = buffer_path.parent / f"{buffer_path.name}.markers.jsonl"
+    sidecar.write_text("\n".join(json.dumps(m) for m in markers) + "\n")
+    return sidecar
+
+
+def test_is_app_recording_distinguishes_from_record_capture(tmp_path: Path) -> None:
+    base = datetime(2026, 10, 25, tzinfo=UTC)
+    capture_path = _write_capture(tmp_path / "record_test", _synthetic_capture(base))
+    assert not cx.is_app_recording(capture_path)
+
+    buffer_path = tmp_path / "sess.jsonl"
+    _write_app_buffer(buffer_path, [])
+    assert cx.is_app_recording(buffer_path)
+
+
+def test_app_parse_signal_id_maps_known_modules() -> None:
+    assert cx._app_parse_signal_id("module7_22f40d") == ("module7", "22F40D")
+    assert cx._app_parse_signal_id("module6_222ab8") == ("module6", "222AB8")
+    assert cx._app_parse_signal_id("module9_221234") is None  # unknown module
+    assert cx._app_parse_signal_id("nounderscore") is None
+
+
+def test_import_app_recording_parses_header_sample_and_gap(tmp_path: Path) -> None:
+    base_ms = int(datetime(2026, 10, 25, tzinfo=UTC).timestamp() * 1000)
+    buffer_path = tmp_path / "sess.jsonl"
+    lines = [
+        _app_exchange_line(
+            1, "module7_22f40d", base_ms, raw=_app_raw("18DAF104", bytes([0x62, 0xF4, 0x0D, 42]))
+        ),
+        _app_exchange_line(
+            2,
+            "module6_222ab8",
+            base_ms + 1000,
+            raw=_app_raw("77A", bytes([0x62, 0x2A, 0xB8, 0x00, 0x11])),
+        ),
+        _app_gap_line(2, "disconnected"),
+        _app_exchange_line(
+            3,
+            "module6_222ab6",
+            base_ms + 2000,
+            raw=_app_raw("77A", bytes([0x62, 0x2A, 0xB6, 0x05])),
+        ),
+    ]
+    _write_app_buffer(buffer_path, lines, created_utc_ms=base_ms)
+
+    entries = cx.import_app_recording(buffer_path)
+    commands = [(e["command"], e["status"]) for e in entries]
+    assert ("ATSH18DA04F1", "OK") in commands
+    assert ("ATCRA18DAF104", "OK") in commands
+    assert ("ATSH710", "OK") in commands
+    assert ("ATCRA77A", "OK") in commands
+    assert ("22F40D", "OK") in commands
+    assert ("222AB8", "OK") in commands
+    assert ("GAP", "GAP") in commands
+    # module6_222ab6 follows module6_222ab8 directly - no second module
+    # switch for the same module.
+    assert sum(1 for c, _ in commands if c == "ATSH710") == 1
+
+    gap_entry = next(e for e in entries if e["command"] == "GAP")
+    assert gap_entry["response"] == "disconnected"
+
+    data = cx.analyze_capture(entries)
+    assert data.modules[("18DA04F1", "18DAF104")].dids["F40D"].samples[0].payload == bytes([42])
+    assert data.modules[("710", "77A")].dids["2AB8"].samples[0].payload == bytes([0x00, 0x11])
+    assert any(kind == "gap" and text == "disconnected" for _t, kind, text in data.log)
+
+
+def test_app_recording_readings_become_note_matches(tmp_path: Path) -> None:
+    # A field equal to 10*soc+5 must be found as a strong match, the same way
+    # a typed `record` note would be - but via the sidecar's typed reading
+    # markers rather than free text.
+    base_ms = int(datetime(2026, 10, 25, tzinfo=UTC).timestamp() * 1000)
+    buffer_path = tmp_path / "sess.jsonl"
+    soc_values = [20, 30, 40, 50]
+    lines = []
+    for i, soc in enumerate(soc_values):
+        t_ms = base_ms + i * 10_000
+        lines.append(
+            _app_exchange_line(
+                i + 1,
+                "module6_222ab8",
+                t_ms,
+                raw=_app_raw("77A", bytes([0x62, 0x2A, 0xB8]) + (10 * soc + 5).to_bytes(2, "big")),
+            )
+        )
+    _write_app_buffer(buffer_path, lines, created_utc_ms=base_ms)
+    _write_app_markers(
+        buffer_path,
+        [
+            {
+                "type": "reading",
+                "quantity": "soc",
+                "value": float(soc),
+                "unit": "%",
+                "read_at": _iso(base_ms + i * 10_000 + 1000),
+                "saved_at": _iso(base_ms + i * 10_000 + 1000),
+                "source": "typed",
+                "prefill": None,
+                "live_value": None,
+                "speed_kmh": None,
+            }
+            for i, soc in enumerate(soc_values)
+        ],
+    )
+
+    _profile_path, report_path = cx.derive(buffer_path, vehicle="Test Car")
+    report = report_path.read_text()
+    section = report.split("## Matches with your notes")[1].split("## Candidates")[0]
+    assert "soc (4 notes)" in section
+    assert "DID 2AB8" in section
+    assert "r=+1.000" in section
+
+
+def test_share_redacts_app_recording(tmp_path: Path) -> None:
+    base_ms = int(datetime(2026, 10, 25, tzinfo=UTC).timestamp() * 1000)
+    buffer_path = tmp_path / "sess.jsonl"
+    lines = [
+        _app_exchange_line(
+            1,
+            "module6_222ab8",
+            base_ms,
+            raw=_app_raw("77A", bytes([0x62, 0x2A, 0xB8, 0x00, 0x0A])),
+        ),
+    ]
+    _write_app_buffer(buffer_path, lines, created_utc_ms=base_ms)
+    _write_app_markers(
+        buffer_path,
+        [
+            {"type": "phase", "phase": "charge", "at": _iso(base_ms + 500)},
+            {"type": "note", "text": "jetzt laden", "at": _iso(base_ms + 600)},
+            {"type": "note", "text": "lunch stop, nothing relevant", "at": _iso(base_ms + 700)},
+            {"type": "event", "label": "adapter reconnected", "at": _iso(base_ms + 800)},
+            {
+                "type": "reading",
+                "quantity": "soc",
+                "value": 42.0,
+                "unit": "%",
+                "read_at": _iso(base_ms + 900),
+                "saved_at": _iso(base_ms + 900),
+                "source": "typed",
+                "prefill": None,
+                "live_value": None,
+                "speed_kmh": None,
+            },
+        ],
+    )
+
+    share_path = cx.share(buffer_path, vehicle="Test Car")
+    cx.validate_share(share_path)  # must not raise
+
+    with gzip.open(share_path, "rt", encoding="utf-8") as handle:
+        lines_out = [json.loads(line) for line in handle]
+    header, entries = lines_out[0], lines_out[1:]
+    assert header == {"didscout_share": 1, "vehicle": "Test Car"}
+
+    texts = [e.get("response") for e in entries]
+    assert "lunch stop, nothing relevant" not in texts  # free-text note, not a phase marker
+    assert "adapter reconnected" not in texts  # free-text event, not a phase marker
+    assert any(e.get("status") == "MARKER" and e.get("response") == "charge" for e in entries)
+    assert any(e.get("command") == "READING" and e.get("response") == "soc 42.0" for e in entries)
+    for entry in entries:
+        assert isinstance(entry["t"], int | float)  # absolute times turned relative
+        for value in entry.values():
+            if isinstance(value, str):
+                assert not cx.ISO_TIMESTAMP_PATTERN.search(value)
+
+
+def test_import_app_recording_tolerates_malformed_lines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base_ms = int(datetime(2026, 10, 25, tzinfo=UTC).timestamp() * 1000)
+    buffer_path = tmp_path / "sess.jsonl"
+    good = _app_exchange_line(
+        1,
+        "module6_222ab8",
+        base_ms,
+        raw=_app_raw("77A", bytes([0x62, 0x2A, 0xB8, 0x00, 0x05])),
+    )
+    unknown_signal = _app_exchange_line(2, "module9_229999", base_ms + 100)
+    raw_lines = [
+        json.dumps(_app_header_line(created_utc_ms=base_ms)),
+        "{not valid json",
+        json.dumps(good),
+        json.dumps(unknown_signal),
+    ]
+    buffer_path.write_text("\n".join(raw_lines) + "\n")
+    (buffer_path.parent / f"{buffer_path.name}.markers.jsonl").write_text("not json either\n")
+
+    entries = cx.import_app_recording(buffer_path)
+    captured = capsys.readouterr()
+    assert "malformed JSON" in captured.err
+    assert "unknown signal id" in captured.err
+    assert any(e["command"] == "222AB8" for e in entries)
+
+
 def test_record_ctrl_c_runs_derive_and_share_on_its_own_run_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

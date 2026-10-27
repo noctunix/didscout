@@ -376,6 +376,30 @@ def test_profile_rejects_discover_range_exceeding_max_sweep_dids(
         _load(tmp_path, broken)
 
 
+def test_profile_module_discover_while_moving_defaults_false_and_parses_true(
+    tmp_path: Path,
+) -> None:
+    default = _load(tmp_path, VALID_PROFILE_TOML, "default.toml")
+    assert default.modules[0].discover_while_moving is False
+
+    opted_in = _load(
+        tmp_path,
+        VALID_PROFILE_TOML.replace(
+            'response = "77A"', 'response = "77A"\ndiscover_while_moving = true'
+        ),
+        "optedin.toml",
+    )
+    assert opted_in.modules[0].discover_while_moving is True
+
+
+def test_profile_rejects_non_bool_discover_while_moving(tmp_path: Path) -> None:
+    broken = VALID_PROFILE_TOML.replace(
+        'response = "77A"', 'response = "77A"\ndiscover_while_moving = "yes"'
+    )
+    with pytest.raises(cx.ProfileError):
+        _load(tmp_path, broken)
+
+
 def test_profile_allows_survey_did_without_name(tmp_path: Path) -> None:
     text = VALID_PROFILE_TOML.replace('name = "test did"\n', "").replace(
         'poll = "once"', 'poll = "survey"\ninterval = 30'
@@ -2226,6 +2250,108 @@ def test_watch_should_log_first_read_change_and_keepalive() -> None:
     # written entry.
     keepalive_due = 1000.0 + cx.RECORD_WATCH_KEEPALIVE_SECONDS
     assert cx._record_watch_should_log(loop_state, key, ex1, now=keepalive_due) is True
+
+
+def test_moving_discovery_blocked_matches_known_systems_case_insensitively() -> None:
+    assert cx.moving_discovery_blocked(None) is False
+    assert cx.moving_discovery_blocked("Gateway") is False
+    assert cx.moving_discovery_blocked("ABS/ESP Steuergeraet") is True
+    assert cx.moving_discovery_blocked("lenkwinkelsensor") is True
+    assert cx.moving_discovery_blocked("Parksperre") is True
+    assert cx.moving_discovery_blocked("Front Brake Module") is True
+
+
+def _discoverable_module(
+    key: str, discover_while_moving: bool = False, f197_name: str | None = None
+) -> cx.RecordModule:
+    module = cx.RecordModule(
+        key=key,
+        protocol="6",
+        setup=[],
+        validator=cx.check_sweep_allowed,
+        responder=None,
+        discover_ranges=[(0x1000, 0x1001)],
+        discover_while_moving=discover_while_moving,
+        f197_name=f197_name,
+    )
+    module.order = [0x1000, 0x1001]
+    return module
+
+
+def test_select_discovery_module_stationary_ignores_discover_while_moving_flag() -> None:
+    module = _discoverable_module("m", discover_while_moving=False)
+    loop_state = cx.RecordLoopState(
+        modules={"m": module}, speed_key=None, by_key={}, next_due={}, phase="stationary"
+    )
+    assert cx._select_discovery_module(loop_state, time.monotonic()) is module
+
+
+def test_select_discovery_module_moving_disabled_by_default() -> None:
+    opted_in = _discoverable_module("in", discover_while_moving=True)
+    loop_state = cx.RecordLoopState(
+        modules={"in": opted_in}, speed_key=None, by_key={}, next_due={}, phase="moving"
+    )
+    assert cx._select_discovery_module(loop_state, time.monotonic()) is None
+
+
+def test_select_discovery_module_moving_requires_opt_in() -> None:
+    opted_out = _discoverable_module("out", discover_while_moving=False)
+    loop_state = cx.RecordLoopState(
+        modules={"out": opted_out},
+        speed_key=None,
+        by_key={},
+        next_due={},
+        phase="moving",
+        discover_while_moving=True,
+        last_moving_discovery=0.0,
+    )
+    assert cx._select_discovery_module(loop_state, time.monotonic()) is None
+
+
+def test_select_discovery_module_moving_picks_opted_in_module_and_rate_limits() -> None:
+    opted_in = _discoverable_module("in", discover_while_moving=True)
+    loop_state = cx.RecordLoopState(
+        modules={"in": opted_in},
+        speed_key=None,
+        by_key={},
+        next_due={},
+        phase="moving",
+        discover_while_moving=True,
+        last_moving_discovery=0.0,
+    )
+    now = time.monotonic()
+    assert cx._select_discovery_module(loop_state, now) is opted_in
+    # A second attempt right away is rate-limited to RECORD_MOVING_DISCOVERY_INTERVAL.
+    assert cx._select_discovery_module(loop_state, now) is None
+
+
+def test_select_discovery_module_moving_excludes_blocked_system_name() -> None:
+    blocked = _discoverable_module("abs", discover_while_moving=True, f197_name="ABS Steuergeraet")
+    loop_state = cx.RecordLoopState(
+        modules={"abs": blocked},
+        speed_key=None,
+        by_key={},
+        next_due={},
+        phase="moving",
+        discover_while_moving=True,
+        last_moving_discovery=0.0,
+    )
+    assert cx._select_discovery_module(loop_state, time.monotonic()) is None
+
+
+def test_select_discovery_module_moving_respects_sleeping_ecu_pause() -> None:
+    paused = _discoverable_module("in", discover_while_moving=True)
+    paused.discovery_paused_until = time.monotonic() + 60.0
+    loop_state = cx.RecordLoopState(
+        modules={"in": paused},
+        speed_key=None,
+        by_key={},
+        next_due={},
+        phase="moving",
+        discover_while_moving=True,
+        last_moving_discovery=0.0,
+    )
+    assert cx._select_discovery_module(loop_state, time.monotonic()) is None
 
 
 def test_record_loop_discovers_while_stationary_pauses_while_moving_and_retries_conditional(

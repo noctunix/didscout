@@ -2178,6 +2178,9 @@ RECORD_OBDUDS_WATCH_INTERVAL = 10.0
 RECORD_DISCOVERED_WATCH_INTERVAL = 30.0
 RECORD_DISCOVERY_BATCH = 16
 RECORD_STATUS_INTERVAL = 10.0
+# --discover-while-moving: at most one discovery batch in this many seconds
+# while the vehicle is moving, regardless of how often the idle branch runs.
+RECORD_MOVING_DISCOVERY_INTERVAL = 5.0
 
 # Discovery DID order, per module: a module's own profile `discover` ranges
 # first, then the standardized ranges most likely to answer, then the rest of
@@ -2240,6 +2243,34 @@ def motion_phase(speed: int | None, age: float | None) -> str:
     return "stationary" if speed == 0 else "moving"
 
 
+# Substrings (case-insensitive) of an F197 system name that block
+# `record --discover-while-moving` on that ECU regardless of the profile's
+# own discover_while_moving flag - steering/braking systems should never see
+# discovery traffic while the vehicle is in motion.
+MOVING_DISCOVERY_BLOCKED_NAME_PARTS = (
+    "abs",
+    "esc",
+    "esp",
+    "eps",
+    "lenk",
+    "steer",
+    "airbag",
+    "brems",
+    "brake",
+    "parksp",
+)
+
+
+def moving_discovery_blocked(f197_name: str | None) -> bool:
+    """True if `f197_name` (an ECU's identified system name, or None if
+    unknown) matches MOVING_DISCOVERY_BLOCKED_NAME_PARTS - this guard is
+    enforced in code and overrides any profile `discover_while_moving` flag."""
+    if f197_name is None:
+        return False
+    lowered = f197_name.lower()
+    return any(part in lowered for part in MOVING_DISCOVERY_BLOCKED_NAME_PARTS)
+
+
 def decode_speed(command: str, ex: Exchange, responder: str | None) -> int | None:
     """Decodes a speed reading (km/h) from a positive mode-01 010D or OBDonUDS
     22F40D exchange, or None if it wasn't a usable positive reply."""
@@ -2278,6 +2309,17 @@ class RecordModule:
     discovered: set[int] = field(default_factory=set)
     conditional: set[int] = field(default_factory=set)
     retry_queue: list[int] = field(default_factory=list)
+    # Opt-in for `record --discover-while-moving` (profile modules only - see
+    # Module.discover_while_moving); always False for a synthetic ECU module.
+    discover_while_moving: bool = False
+    # The ECU's own F197 system name, when already known from the inventory
+    # (ecus11/ecus29/obduds/vag29) - None for a profile module, which is never
+    # identified this way. Used only to block discovery-while-moving on a
+    # steering/braking ECU, never to gate anything else.
+    f197_name: str | None = None
+    # Monotonic deadline before which this module's discovery is paused after
+    # a sleeping-ECU detection (see run_discovery_batch); 0 means not paused.
+    discovery_paused_until: float = 0.0
 
     @property
     def discoverable(self) -> bool:
@@ -2297,12 +2339,18 @@ class RecordWatch:
 
 
 def _ecu_record_module(
-    key: str, request: str, response: str, protocol: str, validator: Callable[[str], str]
+    key: str,
+    request: str,
+    response: str,
+    protocol: str,
+    validator: Callable[[str], str],
+    f197_name: str | None = None,
 ) -> RecordModule:
     """One synthetic RecordModule for an ECU found outside a profile (ecus11,
     ecus29, VAG, OBDonUDS) - same shape as a profile module, full background
     discovery (no profile discover ranges of its own), continuous polling
-    through `validator`."""
+    through `validator`. Never opts into discovery-while-moving on its own -
+    only a profile module can, via its own `discover_while_moving` key."""
     synthetic = Module(id=key, request=request, dids=[], response=response)
     module = RecordModule(
         key=key,
@@ -2312,9 +2360,20 @@ def _ecu_record_module(
         responder=response,
         discover_ranges=[],
         request=request,
+        f197_name=f197_name,
     )
     module.order = discovery_did_order([])
     return module
+
+
+def _identified_f197_name(info: object) -> str | None:
+    """The F197 system name from one ecus11/ecus29/obduds/vag29 state entry's
+    `identify` dict, or None if it wasn't read (e.g. NRC/timeout status
+    strings never look like a real system name a human would type)."""
+    if not isinstance(info, dict):
+        return None
+    name = info.get("identify", {}).get("F197")
+    return name if isinstance(name, str) else None
 
 
 def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, RecordModule]:
@@ -2352,6 +2411,7 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
                     (int(start, 16), int(end, 16)) for start, end in (pm.discover or [])
                 ],
                 request=pm.request,
+                discover_while_moving=pm.discover_while_moving,
             )
 
     ecus11 = state.result("ecus11") or {}
@@ -2361,7 +2421,9 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             response = info.get("response")
             assert isinstance(response, str)
             key = f"ecus11:{request}"
-            modules[key] = _ecu_record_module(key, request, response, "6", check_sweep_allowed)
+            modules[key] = _ecu_record_module(
+                key, request, response, "6", check_sweep_allowed, _identified_f197_name(info)
+            )
 
     obduds = state.result("obduds") or {}
     if isinstance(obduds, dict):
@@ -2369,7 +2431,9 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             assert isinstance(info, dict)
             key = f"obduds:{responder}"
             request = f"18DA{responder[-2:]}F1"
-            modules[key] = _ecu_record_module(key, request, responder, "7", check_sweep_allowed)
+            modules[key] = _ecu_record_module(
+                key, request, responder, "7", check_sweep_allowed, _identified_f197_name(info)
+            )
 
     ecus29 = state.result("ecus29") or {}
     if isinstance(ecus29, dict):
@@ -2379,7 +2443,9 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             assert isinstance(response, str)
             key = f"ecus29:{ecu}"
             request = f"18DA{ecu}F1"
-            modules[key] = _ecu_record_module(key, request, response, "7", check_sweep_allowed)
+            modules[key] = _ecu_record_module(
+                key, request, response, "7", check_sweep_allowed, _identified_f197_name(info)
+            )
 
     vag29 = state.result("vag29") or {}
     if isinstance(vag29, dict):
@@ -2389,7 +2455,9 @@ def build_record_modules(profile: Profile | None, state: RunState) -> dict[str, 
             assert isinstance(response, str)
             key = f"vag29:{ecu}"
             request = f"17FC00{ecu}"
-            modules[key] = _ecu_record_module(key, request, response, "7", check_vag29_allowed)
+            modules[key] = _ecu_record_module(
+                key, request, response, "7", check_vag29_allowed, _identified_f197_name(info)
+            )
 
     for key, module in modules.items():
         if not module.discoverable:
@@ -2605,6 +2673,10 @@ class RecordLoopState:
     # Successful module-switch setup commands (see `_record_ensure_module`) -
     # no longer logged individually, counted here for `record_status_line`.
     setup_commands_sent: int = 0
+    # --discover-while-moving (default off): lets discovery run on opted-in
+    # modules while the vehicle is moving, see RECORD_MOVING_DISCOVERY_INTERVAL.
+    discover_while_moving: bool = False
+    last_moving_discovery: float = field(default_factory=time.monotonic)
 
     def current_phase(self) -> str:
         if self.speed_key is None:
@@ -2613,7 +2685,9 @@ class RecordLoopState:
         return motion_phase(self.speed_value, age)
 
 
-def build_record_loop_state(profile: Profile | None, state: RunState) -> RecordLoopState:
+def build_record_loop_state(
+    profile: Profile | None, state: RunState, discover_while_moving: bool = False
+) -> RecordLoopState:
     modules = build_record_modules(profile, state)
     speed_key = select_speed_source(modules, state)
     watch = build_record_watch(profile, state, modules, speed_key)
@@ -2629,6 +2703,7 @@ def build_record_loop_state(profile: Profile | None, state: RunState) -> RecordL
         profile=profile,
         watch_interval=watch_interval,
         discovery_done_initial=discovery_done_initial,
+        discover_while_moving=discover_while_moving,
     )
 
 
@@ -2881,12 +2956,48 @@ async def _record_maybe_rediscover(
         await _record_rediscover(link, state, state_path, loop_state)
 
 
+def _select_discovery_module(loop_state: RecordLoopState, now: float) -> RecordModule | None:
+    """The module `record_loop_tick`'s idle branch should run one discovery
+    batch on next - honoring a sleeping-ECU pause (discovery_paused_until)
+    and, while moving, `--discover-while-moving`'s extra restrictions: only
+    modules opted in via their profile's discover_while_moving, never one
+    whose F197 name matches moving_discovery_blocked (overrides the profile),
+    and at most one batch per RECORD_MOVING_DISCOVERY_INTERVAL seconds."""
+
+    def available(module: RecordModule) -> bool:
+        return module.has_discovery_work() and now >= module.discovery_paused_until
+
+    if loop_state.phase == "stationary":
+        return next((m for m in loop_state.modules.values() if available(m)), None)
+    if (
+        not loop_state.discover_while_moving
+        or now - loop_state.last_moving_discovery < RECORD_MOVING_DISCOVERY_INTERVAL
+    ):
+        return None
+    module = next(
+        (
+            m
+            for m in loop_state.modules.values()
+            if m.discover_while_moving
+            and available(m)
+            and not moving_discovery_blocked(m.f197_name)
+        ),
+        None,
+    )
+    if module is not None:
+        loop_state.last_moving_discovery = now
+    return module
+
+
 async def record_loop_tick(
     link: AdapterLink, state: RunState, state_path: Path, loop_state: RecordLoopState
 ) -> None:
     """One scheduler iteration: poll whatever's due, grouped by module; else,
     while stationary, run one discovery batch on whichever known module still
-    has work; else sleep until the next due time."""
+    has work - or, with `--discover-while-moving` on, at most one such batch
+    every RECORD_MOVING_DISCOVERY_INTERVAL seconds on an opted-in, unblocked
+    module even while moving (see _select_discovery_module); else sleep until
+    the next due time."""
     now = time.monotonic()
     due = sorted(key for key, due_at in loop_state.next_due.items() if due_at <= now)
     if due:
@@ -2925,11 +3036,7 @@ async def record_loop_tick(
     else:
         changed = _record_apply_phase(link, loop_state)
         await _record_maybe_rediscover(link, state, state_path, loop_state, changed)
-        discovering = None
-        if loop_state.phase == "stationary":
-            discovering = next(
-                (m for m in loop_state.modules.values() if m.has_discovery_work()), None
-            )
+        discovering = _select_discovery_module(loop_state, now)
         if discovering is not None:
             await _record_ensure_module(link, loop_state, discovering.key)
             newly_found = await run_discovery_batch(link, discovering, state, state_path)
@@ -2959,16 +3066,27 @@ async def record_loop_tick(
 
 
 async def run_record_loop(
-    link: AdapterLink, state: RunState, profile: Profile | None, state_path: Path
+    link: AdapterLink,
+    state: RunState,
+    profile: Profile | None,
+    state_path: Path,
+    discover_while_moving: bool = False,
 ) -> None:
     """Runs until cancelled (Ctrl-C): continuously polls every known value and,
     while the vehicle is stationary, discovers further DIDs on every known ECU
-    in the background. Persists watch/discovery progress as it goes, so both a
-    reconnect within this run and a fresh `record` start later resume exactly
-    where this left off."""
-    loop_state = build_record_loop_state(profile, state)
+    in the background - plus, with `discover_while_moving`, a throttled slice
+    of that discovery on opted-in modules while moving too (see
+    _select_discovery_module). Persists watch/discovery progress as it goes,
+    so both a reconnect within this run and a fresh `record` start later
+    resume exactly where this left off."""
+    loop_state = build_record_loop_state(profile, state, discover_while_moving)
     if loop_state.speed_key is None:
         print("[record] no speed source available; discovery stays paused until one appears")
+    if discover_while_moving:
+        print(
+            "[record] discovery while moving enabled: opted-in modules only, "
+            "steering/braking ECUs always excluded"
+        )
     while True:
         await record_loop_tick(link, state, state_path, loop_state)
 
@@ -4149,6 +4267,7 @@ async def record(
     out_dir: Path,
     new: bool,
     inhibit: bool = True,
+    discover_while_moving: bool = False,
 ) -> int:
     """Connects (scanning if no address is given), maintains a resumable run
     directory, reconnects with backoff through BLE drops, runs the one-time
@@ -4239,7 +4358,9 @@ async def record(
                         print_inventory_summary(state)
 
                     try:
-                        await run_record_loop(link, state, profile, state_path)
+                        await run_record_loop(
+                            link, state, profile, state_path, discover_while_moving
+                        )
                     except asyncio.CancelledError:
                         link.record(
                             Exchange(
@@ -4446,6 +4567,12 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="don't hold a systemd-inhibit sleep/idle lock; keep the machine awake yourself",
     )
+    r.add_argument(
+        "--discover-while-moving",
+        action="store_true",
+        help="also run background DID discovery while the vehicle is moving, limited to "
+        "modules opted in via discover_while_moving in the profile (default: off)",
+    )
     d = sub.add_parser(
         "derive",
         help="write a profile draft + report.md from one `record` run's capture log",
@@ -4607,7 +4734,15 @@ def main(argv: list[str]) -> int:
                 parser.error(str(error))
         record_label = re.sub(r"[^a-z0-9_-]", "", args.label.lower()) or "vehicle"
         return asyncio.run(
-            record(args.address, profile, record_label, args.out, args.new, not args.no_inhibit)
+            record(
+                args.address,
+                profile,
+                record_label,
+                args.out,
+                args.new,
+                not args.no_inhibit,
+                args.discover_while_moving,
+            )
         )
     if args.mode == "derive":
         try:

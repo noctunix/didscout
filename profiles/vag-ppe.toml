@@ -21,6 +21,7 @@ id = "gateway"
 request = "710"
 response = "77A"
 discover = [["2A00", "2AFF"]]
+discover_while_moving = true
 
 [[modules.dids]]
 did = "F189"
@@ -204,6 +205,7 @@ id = "tyres"
 request = "70B"
 response = "775"
 discover = [["1800", "18FF"]]
+discover_while_moving = true
 
 [[modules.dids]]
 did = "18A0"
@@ -259,6 +261,1987 @@ interval = 15
 
 [[modules.dids]]
 did = "18A9"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules]]
+id = "hcp1"
+request = "18DA0FF1"
+response = "18DAF10F"
+protocol = "7"
+discover = [["0000", "00FF"], ["0600", "0FFF"]]
+discover_while_moving = true
+
+[[modules.dids]]
+did = "0102"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "010D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "010F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0115"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0116"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0119"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "013D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "013E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0140"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0141"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0142"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0143"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "014F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0173"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0174"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "017A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "017E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0189"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "018A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "018B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "018F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0190"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0191"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0192"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0194"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "019C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "019F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "01A0"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "01A1"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "01A3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0222"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0250"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CA"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CF"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0301"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0302"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0303"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0304"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0306"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "030A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0347"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0350"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0351"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0352"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0364"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0370"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0371"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0407"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "040F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0448"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04A3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04E0"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04F0"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04F1"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FC"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FF"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A26"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A27"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A28"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A29"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A2D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules]]
+id = "tme"
+request = "742"
+response = "7AC"
+discover = [["0000", "01FF"], ["0400", "0FFF"]]
+discover_while_moving = true
+
+[[modules.dids]]
+did = "0250"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0261"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CF"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A26"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A27"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A28"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A29"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "2A2D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules]]
+id = "sacid1"
+request = "18DA26F1"
+response = "18DAF126"
+protocol = "7"
+discover = [["0100", "01FF"], ["0400", "04FF"], ["0000", "00FF"], ["0600", "0FFF"]]
+discover_while_moving = true
+
+[[modules.dids]]
+did = "0250"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0261"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0286"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0288"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02B3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02BD"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CA"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CF"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0301"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0302"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0303"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0311"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0312"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0313"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0314"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0315"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "031A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "031F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0320"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0321"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0326"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0328"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0329"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0330"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0331"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0332"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0333"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0334"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0335"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0336"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0338"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0339"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0342"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0343"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0344"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0345"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0346"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0347"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0350"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0351"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0353"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0354"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0356"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0358"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0360"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0362"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0363"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0365"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "036F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0371"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0372"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0373"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0374"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0375"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0376"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0378"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0379"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0384"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "038D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "038E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0390"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0392"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0394"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0395"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0396"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0397"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0399"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "039D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "039E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "039F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A0"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A2"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A6"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A8"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03AA"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03B4"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03BB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03BE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C2"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C6"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C8"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03CE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03D7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E2"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E4"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E5"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03EB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03EF"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F5"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F6"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F8"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F9"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03FC"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03FD"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03FE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0448"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FC"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0501"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0561"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules]]
+id = "sacid2"
+request = "18DA27F1"
+response = "18DAF127"
+protocol = "7"
+discover = [["0500", "05FF"], ["0000", "01FF"], ["0600", "0FFF"]]
+discover_while_moving = true
+
+[[modules.dids]]
+did = "0250"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0261"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0286"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0288"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02B3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02BD"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CA"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "02CF"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0301"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0302"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0304"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0311"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0312"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0313"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0314"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0315"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "031A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "031F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0320"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0321"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0326"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0328"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0329"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "032E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0332"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0333"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0334"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0336"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0338"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0339"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "033F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0342"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0343"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0344"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0345"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0346"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0347"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0350"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0351"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0353"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0354"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0356"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0358"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "035F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0360"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0362"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0363"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0365"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "036F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0371"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0372"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0373"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0374"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0375"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0376"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0378"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0379"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037B"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037C"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "037D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0384"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "038D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "038E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0390"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0391"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0393"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0395"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0398"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0399"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "039A"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "039D"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "039E"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A0"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A1"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A6"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03A8"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03AA"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03B4"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03BB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03BE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C6"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03C8"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03CE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03D7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E2"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E3"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E4"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03E5"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03EB"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F5"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F6"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F7"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F8"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03F9"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03FC"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03FD"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "03FE"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0407"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "040F"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0410"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "0448"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FC"
+status = "unverified"
+poll = "survey"
+interval = 15
+
+[[modules.dids]]
+did = "04FE"
 status = "unverified"
 poll = "survey"
 interval = 15

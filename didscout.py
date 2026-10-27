@@ -347,6 +347,10 @@ class Module:
     # override or the profile's - to be "7".
     protocol: str | None = None
     discover: list[tuple[str, str]] | None = None
+    # Opt-in: `record --discover-while-moving` runs background discovery on this
+    # module even while the vehicle moves. Still gated in code by an F197 system
+    # name blocklist (steering/braking systems), which overrides this flag.
+    discover_while_moving: bool = False
 
 
 @dataclass
@@ -515,7 +519,15 @@ def _load_modules(raw: object, protocol: str, path: Path) -> list[Module]:
             raise ProfileError(path, context, "must be a table")
         _check_keys(
             entry,
-            {"id", "request", "response", "protocol", "discover", "dids"},
+            {
+                "id",
+                "request",
+                "response",
+                "protocol",
+                "discover",
+                "dids",
+                "discover_while_moving",
+            },
             {"id", "request", "dids"},
             path,
             context,
@@ -562,6 +574,10 @@ def _load_modules(raw: object, protocol: str, path: Path) -> list[Module]:
         discover = _load_discover(entry.get("discover"), path, context)
         dids = _load_dids(entry.get("dids"), path, context)
 
+        discover_while_moving = entry.get("discover_while_moving", False)
+        if not isinstance(discover_while_moving, bool):
+            raise ProfileError(path, f"{context}.discover_while_moving", "must be a boolean")
+
         modules.append(
             Module(
                 id=module_id,
@@ -570,6 +586,7 @@ def _load_modules(raw: object, protocol: str, path: Path) -> list[Module]:
                 protocol=module_protocol,
                 discover=discover,
                 dids=dids,
+                discover_while_moving=discover_while_moving,
             )
         )
     return modules

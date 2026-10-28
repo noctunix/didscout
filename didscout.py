@@ -4228,13 +4228,15 @@ def _app_epoch_iso(epoch_ms: float) -> str:
     return datetime.fromtimestamp(epoch_ms / 1000.0, tz=UTC).isoformat()
 
 
-def _app_parse_signal_id(signal_id: str) -> tuple[str, str] | None:
+def _app_parse_signal_id(
+    signal_id: str, module_headers: dict[str, tuple[str, str]]
+) -> tuple[str, str] | None:
     """`"module7_22f40d"` -> `("module7", "22F40D")`, or None if `signal_id`
     doesn't name a module this importer knows (APP_PLAN_MODULE_HEADERS) - a
     signal from a future plan version is skipped with a warning rather than
     guessed at."""
     module_id, _, command = signal_id.partition("_")
-    if not command or module_id not in APP_PLAN_MODULE_HEADERS:
+    if not command or module_id not in module_headers:
         return None
     return module_id, command.upper()
 
@@ -4322,13 +4324,17 @@ def _app_marker_lines(sidecar_path: Path) -> list[dict[str, object]]:
 
 
 def _app_exchange_entries(
-    module_id: str, command: str, line: dict[str, object], current_module: str | None
+    module_id: str,
+    command: str,
+    line: dict[str, object],
+    current_module: str | None,
+    module_headers: dict[str, tuple[str, str]],
 ) -> list[dict[str, object]]:
     """One recognised exchange line's capture entries: a module header switch
     (if `current_module` differs) followed by the command/response entry
     itself - mirroring how `record` re-sends a module's setup whenever it
     addresses a different one than the last read."""
-    request_header, response_header = APP_PLAN_MODULE_HEADERS[module_id]
+    request_header, response_header = module_headers[module_id]
     epoch_ms = float(line["requestStartedUtcMs"])  # type: ignore[arg-type]
     transport = str(line.get("transport", ""))
     status = APP_TRANSPORT_STATUS.get(transport, "TRANSPORT_ERROR")
@@ -4366,6 +4372,9 @@ def _app_marker_entries(
 
     def warn(what: str) -> None:
         print(f"[didscout] {sidecar_path}: {what}, skipped: {marker!r}", file=sys.stderr)
+
+    if kind == "plan":
+        return None
 
     if kind == "phase":
         at, phase = marker.get("at"), marker.get("phase")
@@ -4415,6 +4424,24 @@ def _app_marker_entries(
     return None
 
 
+def _app_module_headers(markers: list[dict[str, object]]) -> dict[str, tuple[str, str]]:
+    """Module id -> (request, response) headers: from the sidecar's own `plan`
+    line when the recording carries one, else the table for recordings made
+    before the app wrote it."""
+    headers = dict(APP_PLAN_MODULE_HEADERS)
+    for marker in markers:
+        modules = marker.get("modules") if marker.get("type") == "plan" else None
+        if not isinstance(modules, list):
+            continue
+        for module in modules:
+            if not isinstance(module, dict):
+                continue
+            mid, req, resp = module.get("id"), module.get("request"), module.get("response")
+            if isinstance(mid, str) and isinstance(req, str) and isinstance(resp, str):
+                headers[mid] = (req.upper(), resp.upper())
+    return headers
+
+
 def import_app_recording(buffer_path: Path) -> list[dict[str, object]]:
     """Converts an Android app recording (the obdbridge buffer at
     `buffer_path`, plus its `<buffer>.markers.jsonl` sidecar if present) into
@@ -4426,6 +4453,7 @@ def import_app_recording(buffer_path: Path) -> list[dict[str, object]]:
     header, body = _app_buffer_lines(buffer_path)
     sidecar_path = buffer_path.parent / f"{buffer_path.name}.markers.jsonl"
     markers = _app_marker_lines(sidecar_path)
+    module_headers = _app_module_headers(markers)
 
     timed: list[tuple[float, int, list[dict[str, object]]]] = []
     order = 0
@@ -4454,7 +4482,7 @@ def import_app_recording(buffer_path: Path) -> list[dict[str, object]]:
                 file=sys.stderr,
             )
             continue
-        parsed = _app_parse_signal_id(signal_id)
+        parsed = _app_parse_signal_id(signal_id, module_headers)
         if parsed is None:
             print(
                 f"[didscout] {buffer_path}: line {lineno}: unknown signal id {signal_id!r}, "
@@ -4463,7 +4491,7 @@ def import_app_recording(buffer_path: Path) -> list[dict[str, object]]:
             )
             continue
         module_id, command = parsed
-        entries = _app_exchange_entries(module_id, command, line, current_module)
+        entries = _app_exchange_entries(module_id, command, line, current_module, module_headers)
         current_module = module_id
         last_epoch_ms = float(requested_ms)
         timed.append((last_epoch_ms, order, entries))

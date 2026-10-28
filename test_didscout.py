@@ -3974,10 +3974,18 @@ def test_is_app_recording_distinguishes_from_record_capture(tmp_path: Path) -> N
 
 
 def test_app_parse_signal_id_maps_known_modules() -> None:
-    assert cx._app_parse_signal_id("module7_22f40d") == ("module7", "22F40D")
-    assert cx._app_parse_signal_id("module6_222ab8") == ("module6", "222AB8")
-    assert cx._app_parse_signal_id("module9_221234") is None  # unknown module
-    assert cx._app_parse_signal_id("nounderscore") is None
+    assert cx._app_parse_signal_id("module7_22f40d", cx.APP_PLAN_MODULE_HEADERS) == (
+        "module7",
+        "22F40D",
+    )
+    assert cx._app_parse_signal_id("module6_222ab8", cx.APP_PLAN_MODULE_HEADERS) == (
+        "module6",
+        "222AB8",
+    )
+    assert (
+        cx._app_parse_signal_id("module9_221234", cx.APP_PLAN_MODULE_HEADERS) is None
+    )  # unknown module
+    assert cx._app_parse_signal_id("nounderscore", cx.APP_PLAN_MODULE_HEADERS) is None
 
 
 def test_import_app_recording_parses_header_sample_and_gap(tmp_path: Path) -> None:
@@ -4731,3 +4739,23 @@ def test_app_marker_entries_accept_the_legacy_sidecar_format(tmp_path: Path) -> 
     )
     assert phase is not None and phase[1][0]["command"] == "PHASE"
     assert note is not None and note[1][0]["response"] == "soc 50"
+
+
+def test_app_module_headers_prefer_the_sidecar_plan_line() -> None:
+    markers: list[dict[str, object]] = [
+        {
+            "type": "plan",
+            "planId": "p",
+            "planVersion": 1,
+            "at": "2026-01-01T10:00:00Z",
+            "modules": [
+                {"id": "module9", "request": "18da42f1", "response": "18daf142", "protocol": "7"},
+                {"id": "module6", "request": "711", "response": "77B", "protocol": "6"},
+            ],
+        }
+    ]
+    headers = cx._app_module_headers(markers)
+    assert headers["module9"] == ("18DA42F1", "18DAF142")
+    assert headers["module6"] == ("711", "77B")
+    assert headers["module7"] == cx.APP_PLAN_MODULE_HEADERS["module7"]
+    assert cx._app_marker_entries(markers[0], Path("x")) is None

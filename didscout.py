@@ -4358,6 +4358,10 @@ def _app_marker_entries(
     """One marker sidecar line's (epoch_ms, capture entries), or None if it is
     malformed or of an unknown type - warned about by the caller's caller
     through this function's own stderr warnings."""
+    if "type" not in marker and "kind" in marker:
+        # Recordings from app versions before the reading tiles used
+        # {"timestamp", "kind": "phase"|"note"} for the same two marker kinds.
+        marker = {**marker, "type": marker["kind"], "at": marker.get("timestamp")}
     kind = marker.get("type")
 
     def warn(what: str) -> None:

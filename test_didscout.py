@@ -4719,3 +4719,15 @@ def test_record_surfaces_programming_errors_instead_of_reconnecting(
 
     with pytest.raises(TypeError, match="synthetic bug"):
         asyncio.run(asyncio.wait_for(cx.record("fake", None, "vehicle", tmp_path, True), 10))
+
+
+def test_app_marker_entries_accept_the_legacy_sidecar_format(tmp_path: Path) -> None:
+    sidecar = tmp_path / "x.jsonl.markers.jsonl"
+    phase = cx._app_marker_entries(
+        {"timestamp": "2026-01-01T10:00:00Z", "kind": "phase", "phase": "charge"}, sidecar
+    )
+    note = cx._app_marker_entries(
+        {"timestamp": "2026-01-01T10:01:00Z", "kind": "note", "text": "soc 50"}, sidecar
+    )
+    assert phase is not None and phase[1][0]["command"] == "PHASE"
+    assert note is not None and note[1][0]["response"] == "soc 50"

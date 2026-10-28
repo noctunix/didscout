@@ -2245,3 +2245,258 @@ did = "04FE"
 status = "unverified"
 poll = "survey"
 interval = 15
+
+# Further modules found by ECU inventory on the tested vehicle; only the
+# identification name is known so far, everything else is for scouting.
+
+[[modules]]
+id = "steering-column"
+request = "70C"
+response = "776"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "bcm1"
+request = "70E"
+response = "778"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "eps"
+request = "712"
+response = "77C"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "abs"
+request = "713"
+response = "77D"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "cluster"
+request = "714"
+response = "77E"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "airbag"
+request = "715"
+response = "77F"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "hud"
+request = "71B"
+response = "785"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "door-rear-left"
+request = "73E"
+response = "7A8"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "door-rear-right"
+request = "73F"
+response = "7A9"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "trailer"
+request = "747"
+response = "7B1"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "door-front-left"
+request = "74A"
+response = "7B4"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "door-front-right"
+request = "74B"
+response = "7B5"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "seat-front"
+request = "74C"
+response = "7B6"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "camera"
+request = "74F"
+response = "7B9"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "gsm"
+request = "753"
+response = "7BD"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "wba"
+request = "756"
+response = "7C0"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "climate"
+request = "767"
+response = "7D1"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "infotainment"
+request = "773"
+response = "7DD"
+protocol = "6"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "motor-rear"
+request = "18DA06F1"
+response = "18DAF106"
+protocol = "7"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "motor-front"
+request = "18DA07F1"
+response = "18DAF107"
+protocol = "7"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"
+
+[[modules]]
+id = "parking-lock"
+request = "18DA28F1"
+response = "18DAF128"
+protocol = "7"
+
+[[modules.dids]]
+did = "F197"
+name = "system name"
+status = "validated"
+poll = "once"

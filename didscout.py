@@ -4166,6 +4166,11 @@ APP_PLAN_MODULE_HEADERS: dict[str, tuple[str, str]] = {
     "module6": ("710", "77A"),
 }
 
+# The profile the app's plan and discovery seed are generated from: its module
+# ids are what the app's discovery reads are prefixed with, so it still names
+# their headers in recordings made before the sidecar carried `modules` lines.
+APP_PLAN_PROFILE = PROFILES_DIR / "vag-ppe.toml"
+
 # ObdTransportStatusMessage's Dart enum spelling (see CxBufferWriter.kt) to
 # the capture-entry status vocabulary `analyze_capture`/`share` already
 # understand. Every non-OK outcome becomes TRANSPORT_ERROR except an actual
@@ -4232,7 +4237,7 @@ def _app_parse_signal_id(
     signal_id: str, module_headers: dict[str, tuple[str, str]]
 ) -> tuple[str, str] | None:
     """`"module7_22f40d"` -> `("module7", "22F40D")`, or None if `signal_id`
-    doesn't name a module this importer knows (APP_PLAN_MODULE_HEADERS) - a
+    doesn't name a module in `module_headers` (see `_app_module_headers`) - a
     signal from a future plan version is skipped with a warning rather than
     guessed at."""
     module_id, _, command = signal_id.partition("_")
@@ -4373,7 +4378,7 @@ def _app_marker_entries(
     def warn(what: str) -> None:
         print(f"[didscout] {sidecar_path}: {what}, skipped: {marker!r}", file=sys.stderr)
 
-    if kind == "plan":
+    if kind in ("plan", "modules"):
         return None
 
     if kind == "phase":
@@ -4426,11 +4431,17 @@ def _app_marker_entries(
 
 def _app_module_headers(markers: list[dict[str, object]]) -> dict[str, tuple[str, str]]:
     """Module id -> (request, response) headers: from the sidecar's own `plan`
-    line when the recording carries one, else the table for recordings made
-    before the app wrote it."""
-    headers = dict(APP_PLAN_MODULE_HEADERS)
+    and `modules` lines when the recording carries them, else the table for
+    recordings made before the app wrote a `plan` line, else the modules of
+    APP_PLAN_PROFILE for discovery reads made before it wrote `modules` lines."""
+    headers = {
+        module.id: (module.request, module.response)
+        for module in load_profile(APP_PLAN_PROFILE).modules
+        if module.response is not None
+    }
+    headers.update(APP_PLAN_MODULE_HEADERS)
     for marker in markers:
-        modules = marker.get("modules") if marker.get("type") == "plan" else None
+        modules = marker.get("modules") if marker.get("type") in ("plan", "modules") else None
         if not isinstance(modules, list):
             continue
         for module in modules:

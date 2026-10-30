@@ -4759,3 +4759,52 @@ def test_app_module_headers_prefer_the_sidecar_plan_line() -> None:
     assert headers["module6"] == ("711", "77B")
     assert headers["module7"] == cx.APP_PLAN_MODULE_HEADERS["module7"]
     assert cx._app_marker_entries(markers[0], Path("x")) is None
+
+
+def test_app_module_headers_read_the_sidecar_modules_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker: dict[str, object] = {
+        "type": "modules",
+        "at": "2026-01-01T10:00:00Z",
+        "modules": [{"id": "module9", "request": "7a1", "response": "7b1", "protocol": "6"}],
+    }
+    assert cx._app_module_headers([marker])["module9"] == ("7A1", "7B1")
+    assert cx._app_marker_entries(marker, Path("x")) is None
+    assert capsys.readouterr().err == ""
+
+
+def test_app_module_headers_sidecar_beats_the_plan_profile() -> None:
+    markers: list[dict[str, object]] = [
+        {
+            "type": "modules",
+            "at": "2026-01-01T10:00:00Z",
+            "modules": [{"id": "gateway", "request": "711", "response": "77B", "protocol": "6"}],
+        }
+    ]
+    assert cx._app_module_headers(markers)["gateway"] == ("711", "77B")
+
+
+def test_import_app_recording_falls_back_to_the_plan_profile(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base_ms = int(datetime(2026, 10, 25, tzinfo=UTC).timestamp() * 1000)
+    buffer_path = tmp_path / "sess.jsonl"
+    lines = [
+        _app_exchange_line(
+            1, "gateway_222af7", base_ms, raw=_app_raw("77A", bytes([0x62, 0x2A, 0xF7, 0x01]))
+        ),
+        _app_exchange_line(
+            2, "tyres_221234", base_ms + 100, raw=_app_raw("775", bytes([0x62, 0x12, 0x34, 0x02]))
+        ),
+        _app_exchange_line(3, "nosuchecu_221234", base_ms + 200),
+    ]
+    _write_app_buffer(buffer_path, lines, created_utc_ms=base_ms)
+
+    entries = cx.import_app_recording(buffer_path)
+    commands = [e["command"] for e in entries]
+    assert commands == ["ATSH710", "ATCRA77A", "222AF7", "ATSH70B", "ATCRA775", "221234"]
+    err = capsys.readouterr().err
+    assert "'nosuchecu_221234'" in err
+    assert "gateway" not in err
+    assert "tyres" not in err

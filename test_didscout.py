@@ -2225,6 +2225,10 @@ def test_ecus29_vag_scheme_runs_only_when_profile_opts_in(
     monkeypatch.setattr(cx, "ECU29_IDS", [])
     monkeypatch.setattr(cx, "VAG29_IDS", ["05"])
     current_header: dict[str, str] = {"value": ""}
+    # The adapter's receive address: ATAR derives it from the request
+    # header by swapping its last two bytes (right only for 18DAxxF1), an
+    # explicit ATCRA sets it; a reply from any other header is filtered.
+    receive: dict[str, str | None] = {"value": None}
 
     def hex_reply(header: str, message: bytes) -> bytes:
         data = bytes([len(message)]) + message
@@ -2234,9 +2238,17 @@ def test_ecus29_vag_scheme_runs_only_when_profile_opts_in(
         if cmd.startswith("ATSH"):
             current_header["value"] = cmd[4:]
             return b"OK\r>"
+        if cmd == "ATAR":
+            receive["value"] = None
+            return b"OK\r>"
+        if cmd.startswith("ATCRA"):
+            receive["value"] = cmd[5:]
+            return b"OK\r>"
         if cmd.startswith("AT"):
             return b"OK\r>"
-        if current_header["value"] == "17FC0005" and cmd == "22F189":
+        header = current_header["value"]
+        expected = receive["value"] or header[:4] + header[6:] + header[4:6]
+        if header == "17FC0005" and expected == "17FE0005" and cmd == "22F189":
             return hex_reply("17FE0005", b"\x62\xf1\x89\x01")
         return b"NO DATA\r>"
 

@@ -2062,13 +2062,18 @@ async def _discover_ecus(
     {id: response_header}. `make_response` gives the expected response header
     directly for a fixed-addressing scheme (29-bit); pass None to use
     whatever header actually answered instead (11-bit, where the response id
-    isn't implied by the request)."""
+    isn't implied by the request). With `make_response`, each probe sets
+    that receive address explicitly: ATAR derives the reply address by
+    swapping the request's last two bytes, which is right for 18DAxxF1 but
+    filters out every 17FE00xx reply to a 17FC00xx request."""
     found: dict[str, str] = {}
     for candidate in candidates:
         if candidate in skip:
             continue
         request = make_request(candidate)
         await execute(f"ATSH{request}", stage, None)
+        if make_response is not None:
+            await execute(f"ATCRA{make_response(candidate)}", stage, None)
         ex = await execute("22F189", stage, None)
         parsed = parse_isotp("22F189", ex.response)
         seen = {header for header, _payload in parsed.messages} | parsed.partial_headers

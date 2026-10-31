@@ -3258,6 +3258,7 @@ NOTE_KEY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "range": ("reichweite", "rest", "restreichweite", "reichw", "range"),
     "battery_temp": ("batt", "battemp", "batterietemp", "akku", "battery temp"),
     "outside_temp": ("aussen", "aussentemp", "außentemperatur", "outside"),
+    "inside_temp": ("innen", "innentemp", "innentemperatur", "inside"),
     "charge_power": ("ladeleistung", "ladung", "leistung", "kw"),
     "odometer": ("km stand", "kmstand", "kilometerstand", "odometer"),
     "speed": ("kmh", "km/h"),
@@ -3317,10 +3318,13 @@ def _canonical_note_key(words: list[str]) -> str | None:
     for key, keywords in NOTE_KEY_KEYWORDS.items():
         if any(_phrase_matches(words, kw) for kw in keywords if " " in kw):
             return key
-    for key, keywords in NOTE_KEY_KEYWORDS.items():
-        for keyword in keywords:
-            if " " not in keyword and any(_word_matches(w, keyword) for w in words):
-                return key
+    # An exact keyword beats a fuzzy one: "innentemperatur" is itself within
+    # the fuzzy ratio of "außentemperatur".
+    for matches in (str.__eq__, _word_matches):
+        for key, keywords in NOTE_KEY_KEYWORDS.items():
+            for keyword in keywords:
+                if " " not in keyword and any(matches(w, keyword) for w in words):
+                    return key
     return None
 
 
@@ -4199,7 +4203,7 @@ APP_MARKER_PHASES: dict[str, str] = {
 # just trusted - a quantity a future sidecar version adds should fail loudly
 # here instead of silently being treated as some unrelated note key.
 APP_READING_QUANTITIES = frozenset(
-    {"soc", "battery_temp", "outside_temp", "range", "charge_power", "odometer"}
+    {"soc", "battery_temp", "outside_temp", "inside_temp", "range", "charge_power", "odometer"}
 )
 
 

@@ -3510,6 +3510,9 @@ def test_parse_note_accepts_number_first_forms_and_typos() -> None:
     assert cx.parse_note("165 reichweote") == [("range", 165.0)]
     assert cx.parse_note("17153 km") == [("odometer", 17153.0)]
     assert cx.parse_note("11,5 aussen") == [("outside_temp", 11.5)]
+    assert cx.parse_note("21 innentemperatur") == [("inside_temp", 21.0)]
+    assert cx.parse_note("12 außentemperatur") == [("outside_temp", 12.0)]
+    assert cx.parse_note("innen 22") == [("inside_temp", 22.0)]
     assert cx.parse_note("89kw max ladeleistung") == [("max_charge_power", 89.0)]
     assert cx.parse_note("100 kmh") == [("speed", 100.0)]
 
